@@ -6,10 +6,6 @@ from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 import numpy as np
-from sklearn.kernel_ridge import KernelRidge
-from sklearn.linear_model import Ridge
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import PolynomialFeatures
 
 
 @runtime_checkable
@@ -131,10 +127,14 @@ class PolynomialRidgeModel:
     ridge: float = 1e-8
     include_bias: bool = True
     estimator_: object | None = field(default=None, init=False, repr=False)
-    transformer_: PolynomialFeatures | None = field(default=None, init=False, repr=False)
+    transformer_: object | None = field(default=None, init=False, repr=False)
     coef_: np.ndarray | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        from sklearn.linear_model import Ridge
+        from sklearn.pipeline import make_pipeline
+        from sklearn.preprocessing import PolynomialFeatures
+
         self.transformer_ = PolynomialFeatures(degree=self.degree, include_bias=self.include_bias)
         self.estimator_ = make_pipeline(
             PolynomialFeatures(degree=self.degree, include_bias=self.include_bias),
@@ -192,9 +192,11 @@ class KernelRidgeModel:
     degree: int = 2
     # coef0: offset term for polynomial/sigmoid kernels; controls lower-order terms.
     coef0: float = 1.0
-    estimator_: KernelRidge | None = field(default=None, init=False, repr=False)
+    estimator_: object | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        from sklearn.kernel_ridge import KernelRidge
+
         self.estimator_ = KernelRidge(
             alpha=self.alpha,
             kernel=self.kernel,

@@ -8,11 +8,49 @@ from typing import Any, Literal
 import numpy as np
 
 from .metrics import mean_squared_error
-from .models import AffineRidgeModel, augment_features, scaled_ridge_from_gram
+from .models import (
+    AffineRidgeModel,
+    RegressionModel,
+    WeightedRegressionModel,
+    augment_features,
+    scaled_ridge_from_gram,
+)
+from .objectives import SoftObliqueRidgeObjective
+from .optimizers import AdaptiveAlpha, armijo_backtracking
 
 
 HingeMode = Literal["max", "min", "both"]
 ResolvedHingeMode = Literal["max", "min"]
+
+
+def project_unit_w(theta: np.ndarray) -> np.ndarray:
+    """Project theta = [w, z] onto ||w|| = 1, leaving z unchanged."""
+
+    theta = np.asarray(theta, dtype=float).reshape(-1)
+    if theta.size < 2:
+        raise ValueError("theta must contain at least one w component and one z component.")
+    w = theta[:-1]
+    w_norm = np.linalg.norm(w)
+    if w_norm <= 1e-12:
+        raise ValueError("Cannot project theta with near-zero w.")
+    projected = theta.copy()
+    projected[:-1] = w / w_norm
+    return projected
+
+
+def project_unit_w_gradient(theta: np.ndarray, grad: np.ndarray) -> np.ndarray:
+    """Project the w-gradient onto the tangent space of the unit sphere."""
+
+    theta = project_unit_w(theta)
+    grad = np.asarray(grad, dtype=float).reshape(-1)
+    if grad.shape != theta.shape:
+        raise ValueError(f"grad and theta must have the same shape, got {grad.shape} and {theta.shape}.")
+
+    w = theta[:-1]
+    grad_projected = grad.copy()
+    grad_w = grad[:-1]
+    grad_projected[:-1] = grad_w - float(grad_w @ w) * w
+    return grad_projected
 
 
 @dataclass
@@ -21,8 +59,8 @@ class SplitResult:
 
     w: np.ndarray
     z: float
-    left_model: AffineRidgeModel
-    right_model: AffineRidgeModel
+    left_model: RegressionModel
+    right_model: RegressionModel
     loss: float
     parent_loss: float
     split_gain: float
@@ -31,6 +69,281 @@ class SplitResult:
     converged: bool
     n_iters: int
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class SoftObliqueSplitter:
+    """Soft sigmoid oblique splitter optimized by projected gradient descent."""
+
+    model_template: WeightedRegressionModel
+    temperature: float
+    max_iters: int = 100
+    grad_atol: float = 1e-6
+    grad_rtol: float = 1e-5
+    min_side_points: int = 2
+    min_side_fraction: float = 0.0
+    n_restarts: int = 1
+    alpha0: float = 1.0
+    rho: float = 0.5
+    armijo_c: float = 1e-4
+    max_backtracks: int = 25
+    adaptive_alpha: bool = True
+    alpha_min: float = 1e-12
+    alpha_max: float = 1e3
+    alpha_grow: float = 10.0
+    alpha_recovery: float = 10.0
+    heavy_backtrack_threshold: int = 8
+    max_line_search_failures: int = 3
+    weight_floor: float = 1e-12
+    random_state: int | np.random.Generator | None = None
+
+    def split(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        parent_model: RegressionModel | None = None,
+        parent_loss: float | None = None,
+    ) -> SplitResult:
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float).reshape(-1)
+        self._validate_inputs(X, y)
+
+        rng = self._rng()
+        required_side_points = self._required_side_points(X.shape[0])
+        parent_model, parent_loss = self._parent_fit(X, y, parent_model, parent_loss)
+
+        best: SplitResult | None = None
+        for _ in range(max(1, self.n_restarts)):
+            theta0 = self._initialize_theta(X, rng)
+            result = self._optimize_from_initialization(
+                X=X,
+                y=y,
+                theta0=theta0,
+                parent_loss=parent_loss,
+                required_side_points=required_side_points,
+            )
+            if result is not None and (best is None or result.loss < best.loss):
+                best = result
+
+        if best is None:
+            raise RuntimeError("SoftObliqueSplitter could not find a nondegenerate split.")
+        return best
+
+    def _optimize_from_initialization(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        theta0: np.ndarray,
+        parent_loss: float,
+        required_side_points: int,
+    ) -> SplitResult | None:
+        objective = SoftObliqueRidgeObjective(
+            temperature=self.temperature,
+            model_template=self.model_template,
+            weight_floor=self.weight_floor,
+        )
+        theta = project_unit_w(theta0)
+        current = objective.value_and_grad(theta, X, y)
+        loss_history = [current.loss]
+        grad_norm_history = []
+        step_history = []
+        backtrack_history = []
+        alpha_controller = AdaptiveAlpha(
+            alpha=self.alpha0,
+            alpha_min=self.alpha_min,
+            alpha_max=self.alpha_max,
+            grow=self.alpha_grow,
+            recovery=self.alpha_recovery,
+            heavy_backtrack_threshold=self.heavy_backtrack_threshold,
+        )
+        alpha_fixed = float(self.alpha0)
+        converged = False
+        stop_reason = "max_iters"
+        initial_grad_norm = None
+        grad_tolerance = None
+
+        for _ in range(self.max_iters):
+            projected_grad = project_unit_w_gradient(theta, current.grad)
+            direction = -projected_grad
+            directional_derivative = float(current.grad @ direction)
+            grad_norm = float(np.linalg.norm(projected_grad))
+            if initial_grad_norm is None:
+                initial_grad_norm = grad_norm
+                grad_tolerance = self.grad_atol + self.grad_rtol * max(1.0, initial_grad_norm)
+            grad_norm_history.append(grad_norm)
+
+            if grad_norm <= grad_tolerance:
+                converged = True
+                stop_reason = "gradient_tolerance"
+                break
+            if directional_derivative >= 0.0:
+                stop_reason = "non_descent_direction"
+                break
+
+            line_search = None
+            failure_count = 0
+            while True:
+                alpha_start = alpha_controller.alpha if self.adaptive_alpha else alpha_fixed
+                line_search = armijo_backtracking(
+                    value_fn=lambda candidate: objective.value(candidate, X, y),
+                    candidate_fn=lambda alpha: project_unit_w(theta + alpha * direction),
+                    current_value=current.loss,
+                    directional_derivative=directional_derivative,
+                    alpha0=alpha_start,
+                    rho=self.rho,
+                    c=self.armijo_c,
+                    max_backtracks=self.max_backtracks,
+                )
+
+                if self.adaptive_alpha:
+                    alpha_controller.update(line_search, rho=self.rho)
+
+                if line_search.success:
+                    break
+
+                failure_count += 1
+                if not self.adaptive_alpha:
+                    stop_reason = "line_search_failed"
+                    break
+                if failure_count >= self.max_line_search_failures:
+                    stop_reason = "max_line_search_failures"
+                    break
+                if alpha_controller.alpha <= self.alpha_min:
+                    stop_reason = "alpha_min_reached"
+                    break
+
+            if line_search is None or not line_search.success:
+                break
+
+            theta = line_search.theta
+            current = objective.value_and_grad(theta, X, y)
+            loss_history.append(current.loss)
+            step_history.append(line_search.step_size)
+            backtrack_history.append(line_search.n_backtracks)
+
+        return self._make_hard_result(
+            X=X,
+            y=y,
+            theta=theta,
+            parent_loss=parent_loss,
+            converged=converged,
+            required_side_points=required_side_points,
+            metadata={
+                "soft_loss_history": loss_history,
+                "projected_grad_norm_history": grad_norm_history,
+                "step_size_history": step_history,
+                "backtrack_history": backtrack_history,
+                "stop_reason": stop_reason,
+                "temperature": self.temperature,
+                "adaptive_alpha": self.adaptive_alpha,
+                "initial_grad_norm": initial_grad_norm,
+                "grad_tolerance": grad_tolerance,
+                "final_soft_metadata": current.metadata,
+            },
+        )
+
+    def _make_hard_result(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        theta: np.ndarray,
+        parent_loss: float,
+        converged: bool,
+        required_side_points: int,
+        metadata: dict[str, Any],
+    ) -> SplitResult | None:
+        theta = project_unit_w(theta)
+        w = theta[:-1].copy()
+        z = float(theta[-1])
+        right_mask = (X @ w - z) >= 0.0
+        n_right = int(np.sum(right_mask))
+        n_left = int(right_mask.size - n_right)
+        if n_left < required_side_points or n_right < required_side_points:
+            return None
+
+        left_model = self.model_template.clone()
+        right_model = self.model_template.clone()
+        left_model.fit(X[~right_mask], y[~right_mask])
+        right_model.fit(X[right_mask], y[right_mask])
+
+        n = y.shape[0]
+        left_loss = mean_squared_error(y[~right_mask], left_model.predict(X[~right_mask]))
+        right_loss = mean_squared_error(y[right_mask], right_model.predict(X[right_mask]))
+        loss = n_left / n * left_loss + n_right / n * right_loss
+
+        metadata = {
+            **metadata,
+            "required_side_points": required_side_points,
+            "left_loss": left_loss,
+            "right_loss": right_loss,
+        }
+        return SplitResult(
+            w=w,
+            z=z,
+            left_model=left_model,
+            right_model=right_model,
+            loss=loss,
+            parent_loss=parent_loss,
+            split_gain=parent_loss - loss,
+            n_left=n_left,
+            n_right=n_right,
+            converged=converged,
+            n_iters=len(metadata["soft_loss_history"]) - 1,
+            metadata=metadata,
+        )
+
+    def _initialize_theta(self, X: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+        w = rng.normal(size=X.shape[1])
+        w_norm = np.linalg.norm(w)
+        if w_norm <= 1e-12:
+            w[0] = 1.0
+            w_norm = 1.0
+        w = w / w_norm
+        z = float(np.median(X @ w))
+        return np.concatenate([w, np.array([z])])
+
+    def _parent_fit(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        parent_model: RegressionModel | None,
+        parent_loss: float | None,
+    ) -> tuple[RegressionModel, float]:
+        if parent_model is None:
+            parent_model = self.model_template.clone()
+            parent_model.fit(X, y)
+        if parent_loss is None:
+            parent_loss = mean_squared_error(y, parent_model.predict(X))
+        return parent_model, float(parent_loss)
+
+    def _validate_inputs(self, X: np.ndarray, y: np.ndarray) -> None:
+        if X.ndim != 2:
+            raise ValueError(f"X must have shape (n, d), got {X.shape}.")
+        if X.shape[0] != y.shape[0]:
+            raise ValueError(f"X and y length mismatch: {X.shape[0]} != {y.shape[0]}.")
+        if self.temperature <= 0.0:
+            raise ValueError("temperature must be positive.")
+        if self.max_iters < 0:
+            raise ValueError("max_iters must be nonnegative.")
+        if self.grad_atol < 0.0:
+            raise ValueError("grad_atol must be nonnegative.")
+        if self.grad_rtol < 0.0:
+            raise ValueError("grad_rtol must be nonnegative.")
+        if self.min_side_points < 1:
+            raise ValueError("min_side_points must be at least 1.")
+        if not (0.0 <= self.min_side_fraction < 0.5):
+            raise ValueError("min_side_fraction must satisfy 0 <= fraction < 0.5.")
+        if self.max_line_search_failures < 1:
+            raise ValueError("max_line_search_failures must be at least 1.")
+
+    def _required_side_points(self, n_total: int) -> int:
+        fraction_count = int(np.ceil(self.min_side_fraction * n_total))
+        return max(int(self.min_side_points), fraction_count)
+
+    def _rng(self) -> np.random.Generator:
+        if isinstance(self.random_state, np.random.Generator):
+            return self.random_state
+        return np.random.default_rng(self.random_state)
 
 
 @dataclass

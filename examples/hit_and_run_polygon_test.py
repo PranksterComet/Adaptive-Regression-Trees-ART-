@@ -69,7 +69,7 @@ def main() -> None:
     region, vertices = regular_polygon_region(n_sides=7, radius=1.0)
     bounds = np.array([[-1.05, 1.05], [-1.05, 1.05]])
 
-    sampler = HitAndRunSampler(burn_in=1000, thinning=1, bounds=bounds)
+    sampler = HitAndRunSampler(burn_in=1000, thinning=10, bounds=bounds)
     samples = sampler.sample(region, n=5000, random_state=4, x0=np.array([0.0, 0.0]))
 
     diagnostics = grid_uniformity_score(region, samples, bounds=bounds, grid_size=20)

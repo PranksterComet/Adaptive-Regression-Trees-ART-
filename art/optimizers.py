@@ -20,8 +20,9 @@ class LineSearchResult:
 @dataclass
 class AdaptiveAlpha:
     """Stateful controller for the next initial backtracking step size."""
-    # If backtracking fails, smallest step*rho to try next
-
+    # If backtracking fails, smallest step*rho -> alpha
+    # If backtracking succeeds and uses < heavy_backtrack_threshold backtracks, 
+    # next alpha = accepted_step/rho
 
     alpha: float = 1.0
     alpha_min: float = 1e-12

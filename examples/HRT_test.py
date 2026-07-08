@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
-import matplotlib.pyplot as plt
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -17,95 +16,11 @@ from art.models import AffineRidgeModel, augment_features
 from art.sampling import sample_uniform_box
 from art.splitters import HingeAffineSplitter
 
+from plotting_helpers import boundary_from_thetas, plot_boundary
+
 
 def affine_values(X: np.ndarray, theta: np.ndarray) -> np.ndarray:
     return augment_features(X) @ theta
-
-
-def boundary_from_thetas(theta1: np.ndarray, theta2: np.ndarray) -> tuple[np.ndarray, float]:
-    delta = theta1 - theta2
-    w = delta[:-1].copy()
-    z = -float(delta[-1])
-    w_norm = np.linalg.norm(w)
-    if w_norm <= 1e-12:
-        raise ValueError("Degenerate boundary.")
-    return w / w_norm, z / w_norm
-
-
-def clipped_boundary_segment(bounds: np.ndarray, w: np.ndarray, z: float) -> np.ndarray | None:
-    x_min, x_max = bounds[0]
-    y_min, y_max = bounds[1]
-    corners = np.array(
-        [
-            [x_min, y_min],
-            [x_max, y_min],
-            [x_max, y_max],
-            [x_min, y_max],
-        ]
-    )
-    edges = [(0, 1), (1, 2), (2, 3), (3, 0)]
-    points = []
-
-    for i, j in edges:
-        a = corners[i]
-        b = corners[j]
-        direction = b - a
-        denom = float(w @ direction)
-        if abs(denom) <= 1e-14:
-            continue
-        t = (z - float(w @ a)) / denom
-        if -1e-12 <= t <= 1.0 + 1e-12:
-            p = a + np.clip(t, 0.0, 1.0) * direction
-            if not any(np.linalg.norm(p - q) < 1e-9 for q in points):
-                points.append(p)
-
-    if len(points) < 2:
-        return None
-    return np.asarray(points[:2])
-
-
-def plot_boundary(
-    X: np.ndarray,
-    y: np.ndarray,
-    bounds: np.ndarray,
-    true_w: np.ndarray,
-    true_z: float,
-    learned_w: np.ndarray,
-    learned_z: float,
-    title: str,
-    out_path: Path,
-) -> None:
-    true_segment = clipped_boundary_segment(bounds, true_w, true_z)
-    learned_segment = clipped_boundary_segment(bounds, learned_w, learned_z)
-
-    plt.figure(figsize=(6, 6))
-    sc = plt.scatter(X[:, 0], X[:, 1], c=y, s=18, cmap="viridis", alpha=0.8)
-    plt.colorbar(sc, label="f(x)")
-
-    if true_segment is not None:
-        plt.plot(true_segment[:, 0], true_segment[:, 1], color="white", linewidth=4)
-        plt.plot(true_segment[:, 0], true_segment[:, 1], color="black", linewidth=2, label="true boundary")
-    if learned_segment is not None:
-        plt.plot(
-            learned_segment[:, 0],
-            learned_segment[:, 1],
-            color="green",
-            linestyle="--",
-            linewidth=2.5,
-            label="learned boundary",
-        )
-
-    plt.xlim(bounds[0])
-    plt.ylim(bounds[1])
-    plt.gca().set_aspect("equal", adjustable="box")
-    plt.title(title)
-    plt.xlabel("x1")
-    plt.ylabel("x2")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=200)
-    print(f"saved plot: {out_path}")
-    plt.show()
 
 
 def run_case(mode: str, bounds: np.ndarray, theta1: np.ndarray, theta2: np.ndarray) -> None:
