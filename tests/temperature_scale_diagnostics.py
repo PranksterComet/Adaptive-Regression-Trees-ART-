@@ -15,6 +15,7 @@ EXAMPLES_DIR = PROJECT_ROOT / "examples"
 if str(EXAMPLES_DIR) not in sys.path:
     sys.path.insert(0, str(EXAMPLES_DIR))
 
+from art.domain import BoxDomain
 from art.sampling import sample_uniform_box
 from art.temperature import (
     estimate_temperature,
@@ -44,7 +45,7 @@ def main() -> None:
 
     d = args.dim
     n_samples = 100 * (d + 1)
-    bounds = np.tile(np.array([[args.low, args.high]], dtype=float), (d, 1))
+    bounds = BoxDomain.hypercube(d, args.low, args.high).bounds
     X = sample_uniform_box(bounds, n_samples, random_state=args.seed)
 
     max_points = None if args.use_all_points else args.max_points

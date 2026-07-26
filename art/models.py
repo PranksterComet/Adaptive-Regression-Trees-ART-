@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import comb
 from typing import Protocol, runtime_checkable
 
 import numpy as np
@@ -34,6 +35,38 @@ class WeightedRegressionModel(RegressionModel, Protocol):
         weight_floor: float = 1e-12,
     ) -> "WeightedRegressionModel":
         ...
+
+
+def polynomial_feature_count(
+    input_dimension: int,
+    degree: int,
+    include_bias: bool = True,
+) -> int:
+    """Return the number of monomials up to the requested degree."""
+
+    input_dimension = int(input_dimension)
+    degree = int(degree)
+    if input_dimension < 1:
+        raise ValueError("input_dimension must be at least 1.")
+    if degree < 1:
+        raise ValueError("degree must be at least 1.")
+    count = comb(input_dimension + degree, degree)
+    return count if include_bias else count - 1
+
+
+def model_effective_dimension(model: RegressionModel, input_dimension: int) -> int:
+    """Return a model's finite fitting dimension for sample budgeting."""
+
+    method = getattr(model, "effective_dimension", None)
+    if method is None:
+        raise TypeError(
+            f"{type(model).__name__} does not define effective_dimension; "
+            "provide an explicit sample_count policy to the tree builder."
+        )
+    dimension = int(method(input_dimension))
+    if dimension < 1:
+        raise ValueError("Model effective_dimension must be at least 1.")
+    return dimension
 
 
 def augment_features(X: np.ndarray) -> np.ndarray:
@@ -85,6 +118,12 @@ class AffineRidgeModel:
     ridge: float = 1e-8
     coef_: np.ndarray | None = field(default=None, init=False, repr=False)
 
+    def effective_dimension(self, input_dimension: int) -> int:
+        input_dimension = int(input_dimension)
+        if input_dimension < 1:
+            raise ValueError("input_dimension must be at least 1.")
+        return input_dimension + 1
+
     def fit(self, X: np.ndarray, y: np.ndarray) -> "AffineRidgeModel":
         X_aug = augment_features(X)
         y = np.asarray(y, dtype=float).reshape(-1)
@@ -126,26 +165,24 @@ class PolynomialRidgeModel:
     degree: int = 2
     ridge: float = 1e-8
     include_bias: bool = True
-    estimator_: object | None = field(default=None, init=False, repr=False)
     transformer_: object | None = field(default=None, init=False, repr=False)
     coef_: np.ndarray | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        from sklearn.linear_model import Ridge
-        from sklearn.pipeline import make_pipeline
         from sklearn.preprocessing import PolynomialFeatures
 
         self.transformer_ = PolynomialFeatures(degree=self.degree, include_bias=self.include_bias)
-        self.estimator_ = make_pipeline(
-            PolynomialFeatures(degree=self.degree, include_bias=self.include_bias),
-            Ridge(alpha=self.ridge, fit_intercept=False),
+
+    def effective_dimension(self, input_dimension: int) -> int:
+        return polynomial_feature_count(
+            input_dimension,
+            self.degree,
+            include_bias=self.include_bias,
         )
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "PolynomialRidgeModel":
         y = np.asarray(y, dtype=float).reshape(-1)
-        self.estimator_.fit(np.asarray(X, dtype=float), y)
-        self.coef_ = None
-        return self
+        return self.fit_weighted(X, y, np.ones_like(y))
 
     def fit_weighted(
         self,
@@ -165,10 +202,10 @@ class PolynomialRidgeModel:
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
-        if self.coef_ is not None:
-            design = self.transformer_.transform(np.asarray(X, dtype=float))
-            return design @ self.coef_
-        return np.asarray(self.estimator_.predict(np.asarray(X, dtype=float)), dtype=float)
+        if self.coef_ is None:
+            raise ValueError("Model must be fit before calling predict.")
+        design = self.transformer_.transform(np.asarray(X, dtype=float))
+        return design @ self.coef_
 
     def clone(self) -> "PolynomialRidgeModel":
         return PolynomialRidgeModel(

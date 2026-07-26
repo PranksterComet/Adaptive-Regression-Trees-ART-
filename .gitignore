@@ -5,3 +5,11 @@ __pycache__/
 .env
 .venv/
 Papers/
+examples/*_outputs/
+!examples/tree_2D_benchmark_outputs/
+!examples/tree_2D_benchmark_outputs/**
+examples/tree_2D_benchmark_outputs/**/*.csv
+examples/tree_2D_benchmark_outputs/**/.DS_Store
+examples/_smoke_*/
+tests/*_outputs/
+tests/_smoke_*/

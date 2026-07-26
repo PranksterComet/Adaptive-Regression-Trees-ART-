@@ -2,14 +2,46 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from dataclasses import dataclass
 import warnings
+from typing import Literal
 
 import numpy as np
 
 
 TemperatureMode = Literal["median_nn", "median_pairwise_scaled"]
 NearestNeighborMethod = Literal["kdtree", "bruteforce"]
+TemperatureStrategy = Literal["splitter", "fixed", "tune_root", "tune_node"]
+
+DEFAULT_TEMPERATURE_GRID = (1e-4, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0)
+
+
+@dataclass(frozen=True)
+class TemperatureConfig:
+    """Node-level temperature scaling and optional tuning settings."""
+
+    strategy: TemperatureStrategy = "fixed"
+    scale_mode: TemperatureMode = "median_nn"
+    c: float = 0.1
+    c_values: tuple[float, ...] = DEFAULT_TEMPERATURE_GRID
+    validation_fraction: float = 0.2
+    max_points: int | None = 512
+    nn_method: NearestNeighborMethod | None = None
+    bruteforce_dimension_threshold: int = 20
+
+    def __post_init__(self) -> None:
+        if self.strategy not in ("splitter", "fixed", "tune_root", "tune_node"):
+            raise ValueError("Unknown temperature strategy.")
+        if self.c <= 0.0:
+            raise ValueError("Temperature c must be positive.")
+        if not self.c_values or any(value <= 0.0 for value in self.c_values):
+            raise ValueError("Temperature c_values must be nonempty and positive.")
+        if not (0.0 < self.validation_fraction < 0.5):
+            raise ValueError("validation_fraction must satisfy 0 < fraction < 0.5.")
+        if self.max_points is not None and self.max_points < 2:
+            raise ValueError("max_points must be at least 2 or None.")
+        if self.bruteforce_dimension_threshold < 1:
+            raise ValueError("bruteforce_dimension_threshold must be at least 1.")
 
 
 def subsample_points(

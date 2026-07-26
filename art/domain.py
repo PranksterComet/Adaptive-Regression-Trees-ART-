@@ -66,6 +66,24 @@ class BoxDomain:
     def dimension(self) -> int:
         return int(self.bounds.shape[0])
 
+    @classmethod
+    def hypercube(
+        cls,
+        dimension: int,
+        low: float,
+        high: float,
+    ) -> "BoxDomain":
+        """Construct a box with the same interval in every dimension."""
+
+        dimension = int(dimension)
+        if dimension < 1:
+            raise ValueError("dimension must be at least 1.")
+        bounds = np.tile(
+            np.array([[float(low), float(high)]], dtype=float),
+            (dimension, 1),
+        )
+        return cls(bounds)
+
     def as_region(self, depth: int = 0, tag: Optional[str] = "root") -> PolytopeRegion:
         lows = self.bounds[:, 0]
         highs = self.bounds[:, 1]

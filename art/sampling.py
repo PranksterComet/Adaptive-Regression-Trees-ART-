@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, Sequence, runtime_checkable
 
 import numpy as np
 
@@ -11,6 +11,8 @@ from .domain import BoxDomain, PolytopeRegion
 
 
 RandomState = int | np.random.Generator | None
+ThinningCandidateMode = Literal["linear", "powers_of_two"]
+ProbeMode = Literal["coordinates", "random", "both"]
 
 
 def as_rng(random_state: RandomState = None) -> np.random.Generator:
@@ -113,6 +115,231 @@ def find_feasible_point(
             return x
 
     raise RuntimeError("Could not find a feasible point inside the region.")
+
+
+def make_thinning_candidates(
+    max_thinning: int,
+    mode: ThinningCandidateMode = "linear",
+) -> np.ndarray:
+    """Return positive thinning candidates up to max_thinning."""
+
+    max_thinning = int(max_thinning)
+    if max_thinning < 1:
+        raise ValueError("max_thinning must be at least 1.")
+    if mode == "linear":
+        return np.arange(1, max_thinning + 1, dtype=int)
+    if mode == "powers_of_two":
+        candidates = []
+        value = 1
+        while value <= max_thinning:
+            candidates.append(value)
+            value *= 2
+        return np.asarray(candidates, dtype=int)
+    raise ValueError("mode must be 'linear' or 'powers_of_two'.")
+
+
+def autocorrelation_by_lag(series: np.ndarray, lags: Sequence[int]) -> np.ndarray:
+    """Estimate signed autocorrelation for each lag and scalar series.
+
+    Uses one global mean and estimates rho(k) = gamma(k) / gamma(0), where
+    gamma(k) averages over the overlapping lag-k pairs.
+    """
+
+    values = np.asarray(series, dtype=float)
+    if values.ndim == 1:
+        values = values.reshape(-1, 1)
+    if values.ndim != 2:
+        raise ValueError(f"series must have shape (n_steps,) or (n_steps, n_series), got {values.shape}.")
+    if values.shape[0] < 2:
+        raise ValueError("series must contain at least two states.")
+
+    lags_array = np.asarray(lags, dtype=int).reshape(-1)
+    if lags_array.size == 0:
+        raise ValueError("lags must contain at least one value.")
+    if np.any(lags_array < 1):
+        raise ValueError("lags must be atleast 1.")
+    if np.any(lags_array >= values.shape[0]):
+        raise ValueError("all lags must be smaller than the series length.")
+
+    centered = values - np.mean(values, axis=0, keepdims=True)
+    variance = np.mean(centered * centered, axis=0)
+    autocorr = np.zeros((lags_array.size, values.shape[1]), dtype=float)
+
+    for i, lag in enumerate(lags_array):
+        lag_covariance = np.mean(centered[:-lag] * centered[lag:], axis=0)
+        autocorr[i] = np.divide(
+            lag_covariance,
+            variance,
+            out=np.zeros_like(lag_covariance, dtype=float),
+            where=variance > 1e-14,
+        )
+
+    return autocorr
+
+
+def estimate_thinning_from_chain(
+    chain: np.ndarray,
+    candidate_thinnings: Sequence[int] | None = None,
+    max_thinning: int | None = None,
+    candidate_mode: ThinningCandidateMode = "linear",
+    acf_threshold: float = 0.1,
+    stable_window: int = 3,
+    probe_mode: ProbeMode = "both",
+    num_probes: int = 16,
+    whiten: bool = False,
+    covariance_floor: float = 1e-12,
+    random_state: RandomState = None,
+) -> tuple[int, dict[str, object]]:
+    """Estimate a thinning lag from autocorrelation decay of a pilot chain.
+
+    The chain is treated as consecutive hit-and-run states. Autocorrelation is
+    measured on linear probes of the geometry rather than on oracle values.
+    For probe_mode="both", num_probes is the desired total number of probes;
+    all coordinate probes are included, with random probes added if needed.
+    """
+
+    chain = np.asarray(chain, dtype=float)
+    if chain.ndim != 2:
+        raise ValueError(f"chain must have shape (n_steps, d), got {chain.shape}.")
+    if chain.shape[0] < 3:
+        raise ValueError("chain must contain at least three states.")
+    if not (0.0 <= acf_threshold < 1.0):
+        raise ValueError("acf_threshold must satisfy 0 <= threshold < 1.")
+    if stable_window < 1:
+        raise ValueError("stable_window must be at least 1.")
+    if num_probes < 0:
+        raise ValueError("num_probes must be nonnegative.")
+    if covariance_floor <= 0.0:
+        raise ValueError("covariance_floor must be positive.")
+
+    max_valid_lag = max(1, chain.shape[0] // 2)
+    if max_thinning is None:
+        max_lag = max_valid_lag
+    else:
+        max_lag = int(max_thinning)
+        if max_lag < 1:
+            raise ValueError("max_thinning must be at least 1 when provided.")
+    max_lag = min(max_lag, max_valid_lag)
+
+    candidates = _resolve_thinning_candidates(
+        candidate_thinnings=candidate_thinnings,
+        max_lag=max_lag,
+        candidate_mode=candidate_mode,
+    )
+    rng = as_rng(random_state)
+    transformed, transform_metadata = _transform_chain_for_acf(
+        chain,
+        whiten=whiten,
+        covariance_floor=covariance_floor,
+    )
+    probes = _linear_probes(
+        dimension=chain.shape[1],
+        mode=probe_mode,
+        num_probes=num_probes,
+        rng=rng,
+    )
+    num_coordinate_probes = chain.shape[1] if probe_mode in ("coordinates", "both") else 0
+    num_random_probes = int(probes.shape[0] - num_coordinate_probes)
+    probe_series = transformed @ probes.T
+    autocorr_by_lag = autocorrelation_by_lag(probe_series, candidates)
+    rho_by_lag = np.max(np.abs(autocorr_by_lag), axis=1)
+
+    selected_index = len(candidates) - 1
+    window_size = min(int(stable_window), len(candidates))
+    for idx in range(len(candidates) - window_size + 1):
+        if float(np.max(rho_by_lag[idx : idx + window_size])) <= acf_threshold:
+            selected_index = idx
+            break
+
+    metadata: dict[str, object] = {
+        "candidate_thinnings": candidates.tolist(),
+        "autocorrelation_by_lag": autocorr_by_lag.tolist(),
+        "max_abs_autocorrelation": rho_by_lag.tolist(),
+        "selected_index": selected_index,
+        "acf_threshold": acf_threshold,
+        "stable_window": stable_window,
+        "effective_stable_window": window_size,
+        "probe_mode": probe_mode,
+        "num_coordinate_probes": num_coordinate_probes,
+        "num_random_probes": num_random_probes,
+        "num_total_probes": int(probes.shape[0]),
+        "whiten": whiten,
+        "chain_length": int(chain.shape[0]),
+        "max_lag": int(max_lag),
+        **transform_metadata,
+    }
+    return int(candidates[selected_index]), metadata
+
+
+def _resolve_thinning_candidates(
+    candidate_thinnings: Sequence[int] | None,
+    max_lag: int,
+    candidate_mode: ThinningCandidateMode,
+) -> np.ndarray:
+    if candidate_thinnings is None:
+        candidates = make_thinning_candidates(max_lag, mode=candidate_mode)
+    else:
+        candidates = np.asarray(candidate_thinnings, dtype=int).reshape(-1)
+        if candidates.size == 0:
+            raise ValueError("candidate_thinnings must contain at least one value.")
+        if np.any(candidates < 1):
+            raise ValueError("candidate_thinnings must be positive.")
+        candidates = np.unique(candidates)
+        candidates = candidates[candidates <= max_lag]
+
+    if candidates.size == 0:
+        raise ValueError("No thinning candidates are valid for this chain length.")
+    return candidates.astype(int, copy=False)
+
+
+def _transform_chain_for_acf(
+    chain: np.ndarray,
+    whiten: bool,
+    covariance_floor: float,
+) -> tuple[np.ndarray, dict[str, object]]:
+    centered = chain - np.mean(chain, axis=0, keepdims=True)
+    if not whiten:
+        return centered, {"whitening_eig_floor": None, "whitening_condition_number": None}
+
+    cov = centered.T @ centered / max(centered.shape[0] - 1, 1)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    eig_max = float(np.max(eigvals)) if eigvals.size else 0.0
+    eig_floor = float(covariance_floor * max(eig_max, 1.0))
+    eigvals_safe = np.maximum(eigvals, eig_floor)
+    inv_sqrt = eigvecs @ np.diag(1.0 / np.sqrt(eigvals_safe)) @ eigvecs.T
+    condition_number = float(np.max(eigvals_safe) / np.min(eigvals_safe))
+    return centered @ inv_sqrt.T, {
+        "whitening_eig_floor": eig_floor,
+        "whitening_condition_number": condition_number,
+    }
+
+
+def _linear_probes(
+    dimension: int,
+    mode: ProbeMode,
+    num_probes: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    if mode not in ("coordinates", "random", "both"):
+        raise ValueError("probe_mode must be 'coordinates', 'random', or 'both'.")
+
+    probes = []
+    if mode in ("coordinates", "both"):
+        probes.append(np.eye(dimension))
+    n_random = int(num_probes)
+    if mode == "both":
+        n_random = max(0, int(num_probes) - dimension)
+
+    if mode in ("random", "both") and n_random > 0:
+        random_probes = rng.normal(size=(n_random, dimension))
+        norms = np.linalg.norm(random_probes, axis=1)
+        keep = norms > 1e-14
+        if np.any(keep):
+            probes.append(random_probes[keep] / norms[keep, None])
+
+    if not probes:
+        raise ValueError("At least one probe is required.")
+    return np.vstack(probes)
 
 
 @dataclass

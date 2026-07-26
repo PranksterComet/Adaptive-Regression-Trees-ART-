@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional, Union
+from typing import Any, Iterator, Optional, Union
 
 import numpy as np
 
@@ -17,6 +17,7 @@ class LeafNode:
     region: Optional[PolytopeRegion] = None
     depth: int = 0
     node_id: str = "root"
+    status: str = "leaf"
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def predict_one(self, x: np.ndarray) -> float:
@@ -36,6 +37,7 @@ class SplitNode:
     region: Optional[PolytopeRegion] = None
     depth: int = 0
     node_id: str = "root"
+    status: str = "split"
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -52,8 +54,15 @@ class SplitNode:
 class RegressionTree:
     """Prediction-only regression tree."""
 
-    def __init__(self, root: Optional[TreeNode] = None):
+    def __init__(
+        self,
+        root: Optional[TreeNode] = None,
+        oracle_queries: int = 0,
+        metadata: Optional[dict[str, Any]] = None,
+    ):
         self.root = root
+        self.oracle_queries = int(oracle_queries)
+        self.metadata = {} if metadata is None else dict(metadata)
 
     def predict_one(self, x: np.ndarray) -> float:
         leaf = self.leaf_for_point(x)
@@ -76,13 +85,33 @@ class RegressionTree:
             node = node.route(x)
         return node
 
-    def num_leaves(self) -> int:
-        def count(node: TreeNode) -> int:
-            if isinstance(node, LeafNode):
-                return 1
-            return count(node.left) + count(node.right)
+    def iter_nodes(self) -> Iterator[TreeNode]:
+        """Yield all nodes in depth-first, left-to-right order."""
 
-        return 0 if self.root is None else count(self.root)
+        if self.root is None:
+            return
+        stack = [self.root]
+        while stack:
+            node = stack.pop()
+            yield node
+            if isinstance(node, SplitNode):
+                stack.extend([node.right, node.left])
+
+    def iter_leaves(self) -> Iterator[LeafNode]:
+        """Yield all leaf nodes in depth-first, left-to-right order."""
+
+        for node in self.iter_nodes():
+            if isinstance(node, LeafNode):
+                yield node
+
+    def num_nodes(self) -> int:
+        return sum(1 for _ in self.iter_nodes())
+
+    def num_split_nodes(self) -> int:
+        return sum(isinstance(node, SplitNode) for node in self.iter_nodes())
+
+    def num_leaves(self) -> int:
+        return sum(1 for _ in self.iter_leaves())
 
     def max_depth(self) -> int:
         def depth(node: TreeNode) -> int:

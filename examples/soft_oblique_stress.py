@@ -1,4 +1,4 @@
-"""High-dimensional stress test for the affine SoftObliqueSplitter."""
+"""High-dimensional stress test for polynomial SoftObliqueSplitter targets."""
 
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from art.domain import BoxDomain
 from art.metrics import mean_squared_error
-from art.models import AffineRidgeModel
 from art.sampling import sample_uniform_box
 from art.splitters import SoftObliqueSplitter
 from art.temperature import estimate_temperature
@@ -26,10 +25,13 @@ from test_helpers import (
     boundary_errors,
     boundary_misclassification_fraction,
     hard_split_predict,
+    make_model_template,
+    make_piecewise_target,
     parse_csv_floats,
     parse_csv_strings,
-    piecewise_affine,
+    polynomial_feature_count,
     random_affine_theta,
+    random_polynomial_theta,
     sample_balanced_boundary,
 )
 
@@ -43,10 +45,12 @@ def run_candidate(
     args: argparse.Namespace,
     seed: int,
 ):
-    parent_model = AffineRidgeModel(ridge=args.ridge).fit(X_fit, y_fit)
+    include_bias = model_include_bias(args.degree, args.no_bias)
+    model_template = make_model_template(args.degree, ridge=args.ridge, include_bias=include_bias)
+    parent_model = model_template.clone().fit(X_fit, y_fit)
     parent_loss = mean_squared_error(y_fit, parent_model.predict(X_fit))
     splitter = SoftObliqueSplitter(
-        model_template=AffineRidgeModel(ridge=args.ridge),
+        model_template=model_template.clone(),
         temperature=temperature,
         max_iters=args.max_iters,
         grad_atol=args.grad_atol,
@@ -66,11 +70,24 @@ def run_candidate(
         heavy_backtrack_threshold=args.heavy_backtrack_threshold,
         max_line_search_failures=args.max_line_search_failures,
         weight_floor=args.weight_floor,
+        refit_during_line_search=args.refit_during_line_search,
         random_state=seed,
     )
     result = splitter.split(X_fit, y_fit, parent_model=parent_model, parent_loss=parent_loss)
     val_mse = mean_squared_error(y_val, hard_split_predict(X_val, result))
     return result, val_mse
+
+
+def degree_label(degree: int) -> str:
+    if degree == 1:
+        return "affine"
+    if degree == 2:
+        return "quadratic"
+    return f"degree_{degree}"
+
+
+def model_include_bias(degree: int, no_bias: bool) -> bool:
+    return True if degree == 1 else not no_bias
 
 
 def write_csv(rows: list[dict[str, object]], out_path: Path) -> None:
@@ -187,12 +204,14 @@ def save_plots(rows: list[dict[str, object]], output_dir: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dim", type=int, default=5)
+    parser.add_argument("--degree", type=int, default=1)
+    parser.add_argument("--no-bias", action="store_true", help="Disable polynomial bias term for degree > 1.")
     parser.add_argument("--n-trials", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--low", type=float, default=-1.0)
     parser.add_argument("--high", type=float, default=1.0)
     parser.add_argument("--sample-multiplier", type=int, default=50)
-    parser.add_argument("--c-values", type=str, default="0.1,0.5,1.0,2.0")
+    parser.add_argument("--c-values", type=str, default="1e-4,0.005,0.01,0.05,0.1,0.5,1.0")
     parser.add_argument("--temperature-modes", type=str, default="median_nn,median_pairwise_scaled")
     parser.add_argument("--max-temp-points", type=int, default=512)
     parser.add_argument("--use-all-temp-points", action="store_true")
@@ -202,7 +221,7 @@ def main() -> None:
     parser.add_argument("--probe-size", type=int, default=20_000)
     parser.add_argument("--ridge", type=float, default=1e-8)
     parser.add_argument("--max-iters", type=int, default=200)
-    parser.add_argument("--grad-atol", type=float, default=1e-6)
+    parser.add_argument("--grad-atol", type=float, default=1e-8)
     parser.add_argument("--grad-rtol", type=float, default=1e-5)
     parser.add_argument("--min-side-points", type=int, default=8)
     parser.add_argument("--min-side-fraction", type=float, default=0.05)
@@ -219,10 +238,18 @@ def main() -> None:
     parser.add_argument("--heavy-backtrack-threshold", type=int, default=8)
     parser.add_argument("--max-line-search-failures", type=int, default=5)
     parser.add_argument("--weight-floor", type=float, default=1e-12)
+    parser.add_argument(
+        "--refit-during-line-search",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Refit weighted models for every Armijo candidate.",
+    )
     args = parser.parse_args()
 
     if args.dim < 1:
         raise ValueError("--dim must be at least 1.")
+    if args.degree < 1:
+        raise ValueError("--degree must be at least 1.")
     if args.n_trials < 1:
         raise ValueError("--n-trials must be at least 1.")
     if args.low >= args.high:
@@ -232,17 +259,18 @@ def main() -> None:
 
     rng = np.random.default_rng(args.seed)
     d = args.dim
-    n_fit = args.sample_multiplier * (d + 1)
+    include_bias = model_include_bias(args.degree, args.no_bias)
+    n_features = polynomial_feature_count(d, args.degree, include_bias=include_bias)
+    n_fit = args.sample_multiplier * n_features
     n_val = n_fit
     n_test = int(d * 10_000)
-    bounds = np.tile(np.array([[args.low, args.high]], dtype=float), (d, 1))
-    domain = BoxDomain(bounds)
+    domain = BoxDomain.hypercube(d, args.low, args.high)
     c_values = parse_csv_floats(args.c_values)
     temperature_modes = parse_csv_strings(args.temperature_modes)
     max_temp_points = None if args.use_all_temp_points else args.max_temp_points
     nn_method = "bruteforce" if d >= args.bruteforce_dim_threshold else "kdtree"
 
-    output_dir = Path(__file__).with_name("soft_oblique_affine_stress_outputs") / f"dim_{d}"
+    output_dir = Path(__file__).with_name("soft_oblique_stress_outputs") / degree_label(args.degree) / f"dim_{d}"
     output_dir.mkdir(parents=True, exist_ok=True)
     rows = []
 
@@ -254,6 +282,10 @@ def main() -> None:
             "trial": trial,
             "success": False,
             "dimension": d,
+            "degree": args.degree,
+            "degree_label": degree_label(args.degree),
+            "include_bias": include_bias,
+            "n_features": n_features,
             "n_fit": n_fit,
             "n_val": n_val,
             "n_test": n_test,
@@ -261,6 +293,7 @@ def main() -> None:
             "trial_seed": trial_seed,
             "grad_atol": args.grad_atol,
             "grad_rtol": args.grad_rtol,
+            "refit_during_line_search": args.refit_during_line_search,
         }
 
         try:
@@ -271,15 +304,27 @@ def main() -> None:
                 max_attempts=args.boundary_max_attempts,
                 probe_size=args.probe_size,
             )
-            theta_left = random_affine_theta(d, trial_rng)
-            theta_right = random_affine_theta(d, trial_rng)
+            if args.degree == 1:
+                theta_left = random_affine_theta(d, trial_rng)
+                theta_right = random_affine_theta(d, trial_rng)
+            else:
+                theta_left = random_polynomial_theta(d, args.degree, trial_rng, include_bias=include_bias)
+                theta_right = random_polynomial_theta(d, args.degree, trial_rng, include_bias=include_bias)
+            target = make_piecewise_target(
+                true_w=true_w,
+                true_z=true_z,
+                theta_left=theta_left,
+                theta_right=theta_right,
+                degree=args.degree,
+                include_bias=include_bias,
+            )
 
             X_fit = sample_uniform_box(domain.bounds, n_fit, random_state=trial_rng)
-            y_fit = piecewise_affine(X_fit, true_w, true_z, theta_left, theta_right)
+            y_fit = target(X_fit)
             X_val = sample_uniform_box(domain.bounds, n_val, random_state=trial_rng)
-            y_val = piecewise_affine(X_val, true_w, true_z, theta_left, theta_right)
+            y_val = target(X_val)
             X_test = sample_uniform_box(domain.bounds, n_test, random_state=trial_rng)
-            y_test = piecewise_affine(X_test, true_w, true_z, theta_left, theta_right)
+            y_test = target(X_test)
 
             best = None
             candidates = []
@@ -318,7 +363,7 @@ def main() -> None:
             test_mse = mean_squared_error(y_test, y_test_pred)
             grad_history = result.metadata["projected_grad_norm_history"]
             initial_grad_norm = float(grad_history[0]) if grad_history else np.nan
-            final_grad_norm = float(grad_history[-1]) if grad_history else np.nan
+            final_grad_norm = float(result.metadata["final_grad_norm"])
             grad_norm_ratio = final_grad_norm / initial_grad_norm if initial_grad_norm > 0.0 else np.nan
             test_misfrac, boundary_sign = boundary_misclassification_fraction(
                 X_test,
