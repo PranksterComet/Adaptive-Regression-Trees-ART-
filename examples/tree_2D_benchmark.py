@@ -25,20 +25,21 @@ from art.metrics import (
     median_pointwise_relative_error,
     relative_l2_error,
 )
+from art.presets import DEFAULT_TREE_PRESET, resolve_min_side_points
 from art.sampling import HitAndRunSampler, sample_uniform_box
-from art.splitters import SoftObliqueSplitter
-from art.temperature import DEFAULT_TEMPERATURE_GRID, TemperatureConfig
 from art.tree import LeafNode, SplitNode
 
 from examples.benchmark_functions import (
     GAUSSIAN_DEFAULT_INTERVAL,
     PLANE_WAVE_DEFAULT_INTERVAL,
     QUADRATIC_DEFAULT_INTERVAL,
+    RASTRIGIN_DEFAULT_INTERVAL,
     ROSENBROCK_DEFAULT_INTERVAL,
     SPHERICAL_PIECEWISE_DEFAULT_INTERVAL,
     GaussianFunction,
     PlaneWaveFunction,
     QuadraticFunction,
+    RastriginFunction,
     RosenbrockFunction,
     SphericalPiecewisePolynomialFunction,
     default_gaussian_mixture_2d,
@@ -48,10 +49,16 @@ from examples.benchmark_functions import (
 from examples.plotting_helpers import (
     make_tree_leaf_grid,
     save_function_contour,
+    save_tree_contour,
     save_tree_leaf_error_regions,
     save_tree_leaf_regions,
 )
-from examples.test_helpers import make_model_template, parse_csv_floats
+from examples.test_helpers import make_model_template
+from examples.tree_benchmark_helpers import (
+    add_splitter_selection_arguments,
+    build_timing_report_lines,
+    make_benchmark_splitter,
+)
 
 
 DIMENSION = 2
@@ -63,6 +70,7 @@ BENCHMARK_DEFAULT_INTERVALS = {
     "plane_wave": PLANE_WAVE_DEFAULT_INTERVAL,
     "spherical_piecewise": SPHERICAL_PIECEWISE_DEFAULT_INTERVAL,
     "rosenbrock": ROSENBROCK_DEFAULT_INTERVAL,
+    "rastrigin": RASTRIGIN_DEFAULT_INTERVAL,
 }
 ERROR_METRICS = {
     "relative_l2": relative_l2_error,
@@ -70,6 +78,10 @@ ERROR_METRICS = {
     "median_pointwise_relative": median_pointwise_relative_error,
     "max_pointwise_relative": max_pointwise_relative_error,
 }
+TREE_DEFAULTS = DEFAULT_TREE_PRESET
+SAMPLING_DEFAULTS = TREE_DEFAULTS.sampling
+TEMPERATURE_DEFAULTS = TREE_DEFAULTS.temperature
+SPLITTER_DEFAULTS = TREE_DEFAULTS.splitter
 
 
 def configured_error_metric(
@@ -224,18 +236,24 @@ def make_benchmark_target(
             "outside_w": outside.w.tolist(),
             "outside_quadratic_matrix": outside.quadratic_matrix.tolist(),
         }
-    else:
+    elif args.benchmark == "rosenbrock":
         target = RosenbrockFunction(
             dimension=DIMENSION,
             a=args.rosenbrock_a,
             b=args.rosenbrock_b,
         )
         metadata = {"a": target.a, "b": target.b}
+    else:
+        target = RastriginFunction(
+            dimension=DIMENSION,
+            A=args.rastrigin_a,
+        )
+        metadata = {"A": target.A}
     metadata["offset"] = float(args.offset)
     return add_output_offset(target, args.offset), metadata
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
 
     # Experiment and target settings.
@@ -293,6 +311,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--rosenbrock-a", type=float, default=1.0)
     parser.add_argument("--rosenbrock-b", type=float, default=100.0)
+    parser.add_argument("--rastrigin-a", type=float, default=10.0)
     parser.add_argument("--grid-resolution", type=int, default=500)
     parser.add_argument("--contour-levels", type=int, default=30)
     parser.add_argument(
@@ -307,20 +326,26 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Annotate leaf regions with labels matching node_diagnostics.csv.",
     )
-    parser.add_argument("--relative-error-floor", type=float, default=1e-12)
+    parser.add_argument(
+        "--relative-error-floor",
+        type=float,
+        default=TREE_DEFAULTS.relative_error_floor,
+    )
     parser.add_argument("--output-dir", type=Path, default=None)
 
     # Tree and polynomial leaf-model settings.
-    parser.add_argument("--leaf-degree", type=int, default=1)
+    add_splitter_selection_arguments(parser)
+    parser.add_argument("--leaf-degree", type=int, default=TREE_DEFAULTS.leaf_degree)
     parser.add_argument(
-        "--no-leaf-bias",
-        action="store_true",
-        help="Exclude the constant feature from polynomial leaves of degree greater than one.",
+        "--leaf-bias",
+        action=argparse.BooleanOptionalAction,
+        default=TREE_DEFAULTS.leaf_include_bias,
+        help="Include the constant feature in polynomial leaves.",
     )
     parser.add_argument(
         "--error-metric",
         choices=tuple(ERROR_METRICS),
-        default="relative_l2",
+        default=TREE_DEFAULTS.error_metric,
         help="Training error metric used to decide whether a node becomes a leaf.",
     )
     parser.add_argument(
@@ -328,77 +353,204 @@ def parse_args() -> argparse.Namespace:
         "--error-threshold",
         dest="error_tolerance",
         type=float,
-        default=1e-2,
+        default=TREE_DEFAULTS.error_tolerance,
         help="Stop splitting a node when its selected training error is at most this value.",
     )
-    parser.add_argument("--max-depth", type=int, default=5)
-    parser.add_argument("--sample-multiplier", type=int, default=50)
-    parser.add_argument("--ridge", type=float, default=1e-8)
-    parser.add_argument("--min-split-gain", type=float, default=0.0)
-    parser.add_argument("--min-relative-split-gain", type=float, default=1e-3)
+    parser.add_argument("--max-depth", type=int, default=TREE_DEFAULTS.max_depth)
+    parser.add_argument(
+        "--sample-multiplier", type=int, default=TREE_DEFAULTS.sample_multiplier
+    )
+    parser.add_argument(
+        "--sample-count",
+        type=int,
+        default=TREE_DEFAULTS.sample_count,
+        help="Fixed samples per node; overrides sample_multiplier*d_eff when provided.",
+    )
+    parser.add_argument("--ridge", type=float, default=TREE_DEFAULTS.ridge)
+    parser.add_argument(
+        "--ridge-solver",
+        choices=("auto", "normal", "qr", "svd"),
+        default=TREE_DEFAULTS.ridge_solver,
+        help="Linear solver used for all affine or polynomial ridge fits.",
+    )
+    parser.add_argument(
+        "--auto-rcond-threshold",
+        type=float,
+        default=TREE_DEFAULTS.auto_rcond_threshold,
+        help="Minimum regularized-Gram rcond accepted by the auto Cholesky path.",
+    )
+    parser.add_argument(
+        "--min-split-gain", type=float, default=TREE_DEFAULTS.min_split_gain
+    )
+    parser.add_argument(
+        "--min-relative-split-gain",
+        type=float,
+        default=TREE_DEFAULTS.min_relative_split_gain,
+    )
 
     # Hit-and-run settings for topping up child samples.
-    parser.add_argument("--burn-in", type=int, default=0)
-    parser.add_argument("--thinning", type=int, default=20)
+    parser.add_argument("--burn-in", type=int, default=SAMPLING_DEFAULTS.burn_in)
+    parser.add_argument("--thinning", type=int, default=SAMPLING_DEFAULTS.thinning)
+    parser.add_argument(
+        "--sampling-feasibility-tol",
+        type=float,
+        default=SAMPLING_DEFAULTS.feasibility_tol,
+    )
+    parser.add_argument(
+        "--max-feasible-tries",
+        type=int,
+        default=SAMPLING_DEFAULTS.max_feasible_tries,
+    )
+    parser.add_argument(
+        "--isotropic-sampling",
+        action=argparse.BooleanOptionalAction,
+        default=SAMPLING_DEFAULTS.isotropic_sampling,
+        help="Estimate a node covariance from an unthinned pilot before sampling.",
+    )
+    parser.add_argument(
+        "--isotropic-pilot-multiplier",
+        type=int,
+        default=SAMPLING_DEFAULTS.isotropic_pilot_multiplier,
+    )
+    parser.add_argument(
+        "--direction-eigenvalue-floor",
+        type=float,
+        default=SAMPLING_DEFAULTS.direction_eigenvalue_floor,
+    )
+    parser.add_argument(
+        "--exact-box-root",
+        action=argparse.BooleanOptionalAction,
+        default=TREE_DEFAULTS.exact_box_root,
+        help="Sample a box root exactly rather than with hit-and-run.",
+    )
+    parser.add_argument(
+        "--store-samples",
+        action=argparse.BooleanOptionalAction,
+        default=TREE_DEFAULTS.store_samples,
+    )
+    parser.add_argument(
+        "--store-diagnostics",
+        action=argparse.BooleanOptionalAction,
+        default=TREE_DEFAULTS.store_diagnostics,
+    )
+    parser.add_argument(
+        "--profile-build-timing",
+        action=argparse.BooleanOptionalAction,
+        default=TREE_DEFAULTS.profile_build_timing,
+        help="Measure aggregate sampling, splitter, and optimizer-refit time.",
+    )
+    parser.add_argument(
+        "--oracle-vectorized",
+        action=argparse.BooleanOptionalAction,
+        default=TREE_DEFAULTS.oracle_vectorized,
+    )
 
-    # Root-only temperature tuning settings.
+    # Node-local temperature scaling and optional tuning settings.
+    parser.add_argument(
+        "--temperature-strategy",
+        choices=("splitter", "fixed", "tune_root", "tune_node"),
+        default=TEMPERATURE_DEFAULTS.strategy,
+    )
     parser.add_argument(
         "--temperature-scale-mode",
         choices=("median_nn", "median_pairwise_scaled"),
-        default="median_nn",
+        default=TEMPERATURE_DEFAULTS.scale_mode,
     )
     parser.add_argument(
         "--temperature-c-values",
         type=str,
-        default=",".join(str(value) for value in DEFAULT_TEMPERATURE_GRID),
+        default=",".join(str(value) for value in TEMPERATURE_DEFAULTS.c_values),
     )
-    parser.add_argument("--temperature-validation-fraction", type=float, default=0.2)
-    parser.add_argument("--max-temperature-points", type=int, default=512)
-    parser.add_argument("--temperature-c", type=float, default=0.1)
-    parser.add_argument("--nn-method", choices=("auto", "kdtree", "bruteforce"), default="auto")
-    parser.add_argument("--bruteforce-dimension-threshold", type=int, default=20)
+    parser.add_argument(
+        "--temperature-validation-fraction",
+        type=float,
+        default=TEMPERATURE_DEFAULTS.validation_fraction,
+    )
+    parser.add_argument(
+        "--max-temperature-points",
+        type=int,
+        default=TEMPERATURE_DEFAULTS.max_points,
+    )
+    parser.add_argument("--temperature-c", type=float, default=TEMPERATURE_DEFAULTS.c)
+    parser.add_argument(
+        "--nn-method",
+        choices=("auto", "kdtree", "bruteforce"),
+        default=TEMPERATURE_DEFAULTS.nn_method,
+    )
+    parser.add_argument(
+        "--bruteforce-dimension-threshold",
+        type=int,
+        default=TEMPERATURE_DEFAULTS.bruteforce_dimension_threshold,
+    )
 
-    # Soft-oblique optimizer settings, matching the stress-test defaults.
-    parser.add_argument("--temperature-placeholder", type=float, default=0.1)
-    parser.add_argument("--max-iters", type=int, default=200)
-    parser.add_argument("--grad-atol", type=float, default=1e-8)
-    parser.add_argument("--grad-rtol", type=float, default=1e-5)
-    parser.add_argument("--min-side-points", type=int, default=8)
-    parser.add_argument("--min-side-fraction", type=float, default=0.00)
-    parser.add_argument("--n-restarts", type=int, default=1)
+    # Shared split constraints and soft-oblique optimizer settings.
+    parser.add_argument(
+        "--temperature-placeholder",
+        type=float,
+        default=SPLITTER_DEFAULTS.temperature_placeholder,
+    )
+    parser.add_argument("--max-iters", type=int, default=SPLITTER_DEFAULTS.max_iters)
+    parser.add_argument("--grad-atol", type=float, default=SPLITTER_DEFAULTS.grad_atol)
+    parser.add_argument("--grad-rtol", type=float, default=SPLITTER_DEFAULTS.grad_rtol)
+    parser.add_argument(
+        "--min-side-points",
+        type=int,
+        default=SPLITTER_DEFAULTS.min_side_points,
+        help="Minimum points per hard-split side; default is the model effective dimension.",
+    )
+    parser.add_argument(
+        "--min-side-fraction",
+        type=float,
+        default=SPLITTER_DEFAULTS.min_side_fraction,
+    )
+    parser.add_argument("--n-restarts", type=int, default=SPLITTER_DEFAULTS.n_restarts)
     parser.add_argument(
         "--max-retries-on-failure",
         type=int,
-        default=0,
+        default=TREE_DEFAULTS.max_retries_on_failure,
         help="Additional splitter attempts after min-side or split-gain rejection.",
     )
-    parser.add_argument("--alpha0", type=float, default=1.0)
-    parser.add_argument("--rho", type=float, default=0.5)
-    parser.add_argument("--armijo-c", type=float, default=1e-4)
-    parser.add_argument("--max-backtracks", type=int, default=25)
+    parser.add_argument("--alpha0", type=float, default=SPLITTER_DEFAULTS.alpha0)
+    parser.add_argument("--rho", type=float, default=SPLITTER_DEFAULTS.rho)
+    parser.add_argument("--armijo-c", type=float, default=SPLITTER_DEFAULTS.armijo_c)
+    parser.add_argument(
+        "--max-backtracks", type=int, default=SPLITTER_DEFAULTS.max_backtracks
+    )
     parser.add_argument(
         "--adaptive-alpha",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=SPLITTER_DEFAULTS.adaptive_alpha,
     )
-    parser.add_argument("--alpha-min", type=float, default=1e-12)
-    parser.add_argument("--alpha-max", type=float, default=1e8)
-    parser.add_argument("--alpha-grow", type=float, default=10.0)
-    parser.add_argument("--alpha-recovery", type=float, default=10.0)
-    parser.add_argument("--heavy-backtrack-threshold", type=int, default=8)
-    parser.add_argument("--max-line-search-failures", type=int, default=5)
-    parser.add_argument("--weight-floor", type=float, default=1e-12)
+    parser.add_argument("--alpha-min", type=float, default=SPLITTER_DEFAULTS.alpha_min)
+    parser.add_argument("--alpha-max", type=float, default=SPLITTER_DEFAULTS.alpha_max)
+    parser.add_argument("--alpha-grow", type=float, default=SPLITTER_DEFAULTS.alpha_grow)
+    parser.add_argument(
+        "--alpha-recovery", type=float, default=SPLITTER_DEFAULTS.alpha_recovery
+    )
+    parser.add_argument(
+        "--heavy-backtrack-threshold",
+        type=int,
+        default=SPLITTER_DEFAULTS.heavy_backtrack_threshold,
+    )
+    parser.add_argument(
+        "--max-line-search-failures",
+        type=int,
+        default=SPLITTER_DEFAULTS.max_line_search_failures,
+    )
+    parser.add_argument(
+        "--weight-floor", type=float, default=SPLITTER_DEFAULTS.weight_floor
+    )
     parser.add_argument(
         "--refit-during-line-search",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Refit weighted models for every Armijo candidate.",
+        default=SPLITTER_DEFAULTS.refit_during_line_search,
+        help="Refit weighted models for every Armijo candidate instead of freezing them.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     default_interval = BENCHMARK_DEFAULT_INTERVALS[args.benchmark]
     domain_low = default_interval[0] if args.domain_low is None else args.domain_low
     domain_high = default_interval[1] if args.domain_high is None else args.domain_high
@@ -420,6 +572,8 @@ def main() -> None:
         raise ValueError("--n-test must be positive.")
     if args.leaf_degree < 1:
         raise ValueError("--leaf-degree must be at least 1.")
+    if args.splitter == "hrt" and args.leaf_degree != 1:
+        raise ValueError("--splitter hrt requires --leaf-degree 1.")
     if args.grid_resolution < 2:
         raise ValueError("--grid-resolution must be at least 2.")
     if args.contour_levels < 2:
@@ -438,7 +592,13 @@ def main() -> None:
     output_dir = (
         args.output_dir
         if args.output_dir is not None
-        else DEFAULT_OUTPUT_ROOT / args.benchmark / f"degree_{args.leaf_degree}"
+        else DEFAULT_OUTPUT_ROOT
+        / args.benchmark
+        / (
+            f"degree_{args.leaf_degree}"
+            if args.splitter == "soft_oblique"
+            else f"degree_{args.leaf_degree}_hrt"
+        )
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     domain = BoxDomain.hypercube(DIMENSION, domain_low, domain_high)
@@ -448,48 +608,31 @@ def main() -> None:
     )
 
     target, target_metadata = make_benchmark_target(args)
-    leaf_include_bias = True if args.leaf_degree == 1 else not args.no_leaf_bias
+    leaf_include_bias = True if args.leaf_degree == 1 else args.leaf_bias
     model = make_model_template(
         args.leaf_degree,
         ridge=args.ridge,
         include_bias=leaf_include_bias,
+        solver=args.ridge_solver,
+        auto_rcond_threshold=args.auto_rcond_threshold,
     )
-    splitter = SoftObliqueSplitter(
-        model_template=model.clone(),
-        # The builder replaces this value using root-only temperature tuning.
-        temperature=args.temperature_placeholder,
-        max_iters=args.max_iters,
-        grad_atol=args.grad_atol,
-        grad_rtol=args.grad_rtol,
-        min_side_points=args.min_side_points,
-        min_side_fraction=args.min_side_fraction,
-        n_restarts=args.n_restarts,
-        alpha0=args.alpha0,
-        rho=args.rho,
-        armijo_c=args.armijo_c,
-        max_backtracks=args.max_backtracks,
-        adaptive_alpha=args.adaptive_alpha,
-        alpha_min=args.alpha_min,
-        alpha_max=args.alpha_max,
-        alpha_grow=args.alpha_grow,
-        alpha_recovery=args.alpha_recovery,
-        heavy_backtrack_threshold=args.heavy_backtrack_threshold,
-        max_line_search_failures=args.max_line_search_failures,
-        weight_floor=args.weight_floor,
-        refit_during_line_search=args.refit_during_line_search,
-        random_state=args.seed,
+    min_side_points, min_side_points_policy = resolve_min_side_points(
+        args.min_side_points,
+        model,
+        DIMENSION,
     )
-    temperature_config = TemperatureConfig(
-        strategy="tune_root",
-        scale_mode=args.temperature_scale_mode,
-        c=args.temperature_c,
-        c_values=tuple(parse_csv_floats(args.temperature_c_values)),
-        validation_fraction=args.temperature_validation_fraction,
-        max_points=args.max_temperature_points,
-        nn_method=None if args.nn_method == "auto" else args.nn_method,
-        bruteforce_dimension_threshold=args.bruteforce_dimension_threshold,
+    splitter, temperature_config = make_benchmark_splitter(
+        args,
+        model,
+        min_side_points,
     )
-    sampler = HitAndRunSampler(burn_in=args.burn_in, thinning=args.thinning)
+    sampler = HitAndRunSampler(
+        burn_in=args.burn_in,
+        thinning=args.thinning,
+        feasibility_tol=args.sampling_feasibility_tol,
+        max_feasible_tries=args.max_feasible_tries,
+        direction_eigenvalue_floor=args.direction_eigenvalue_floor,
+    )
     builder = RegressionTreeBuilder(
         domain=domain,
         oracle=target,
@@ -499,17 +642,26 @@ def main() -> None:
         max_depth=args.max_depth,
         error_metric=stopping_metric,
         sample_multiplier=args.sample_multiplier,
-        sample_count=None,
+        sample_count=args.sample_count,
         sampler=sampler,
-        root_sampler=HitAndRunSampler(burn_in=args.burn_in, thinning=args.thinning),
-        exact_box_root=True,
+        root_sampler=HitAndRunSampler(
+            burn_in=args.burn_in,
+            thinning=args.thinning,
+            feasibility_tol=args.sampling_feasibility_tol,
+            max_feasible_tries=args.max_feasible_tries,
+            direction_eigenvalue_floor=args.direction_eigenvalue_floor,
+        ),
+        exact_box_root=args.exact_box_root,
+        isotropic_sampling=args.isotropic_sampling,
+        isotropic_pilot_multiplier=args.isotropic_pilot_multiplier,
         temperature_config=temperature_config,
         min_split_gain=args.min_split_gain,
         min_relative_split_gain=args.min_relative_split_gain,
         max_retries_on_failure=args.max_retries_on_failure,
-        store_samples=False,
-        store_diagnostics=True,
-        oracle_vectorized=True,
+        store_samples=args.store_samples,
+        store_diagnostics=args.store_diagnostics,
+        profile_build_timing=args.profile_build_timing,
+        oracle_vectorized=args.oracle_vectorized,
         random_state=args.seed,
     )
 
@@ -517,6 +669,21 @@ def main() -> None:
     build_result = builder.build()
     build_seconds = time.perf_counter() - start
     tree = build_result.tree
+    tree_path = output_dir / "tree.joblib"
+    tree_run_config = {
+        "arguments": {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(args).items()
+        },
+        "resolved_domain_bounds": domain.bounds.tolist(),
+        "resolved_min_side_points": min_side_points,
+        "min_side_points_policy": min_side_points_policy,
+        "target": target_metadata,
+    }
+    start = time.perf_counter()
+    tree.save(tree_path, run_config=tree_run_config)
+    tree_save_seconds = time.perf_counter() - start
+    print(f"saved tree: {tree_path}")
 
     start = time.perf_counter()
     X_test = sample_uniform_box(domain.bounds, args.n_test, random_state=args.test_seed)
@@ -537,6 +704,8 @@ def main() -> None:
         y_test, y_pred, floor=args.relative_error_floor
     )
     test_max_absolute = float(np.max(np.abs(y_test - y_pred)))
+    test_oracle_min = float(np.min(y_test))
+    test_oracle_max = float(np.max(y_test))
 
     nodes = list(tree.iter_nodes())
     leaves = [node for node in nodes if isinstance(node, LeafNode)]
@@ -551,6 +720,16 @@ def main() -> None:
         warning
         for node in split_nodes
         for warning in node.metadata.get("warnings", ())
+    )
+    node_warnings = Counter(
+        warning
+        for node in nodes
+        for warning in node.metadata.get("warnings", ())
+    )
+    sampling_warnings = Counter(
+        warning
+        for node in nodes
+        for warning in node.metadata.get("sampling_warnings", ())
     )
 
     plot_start = time.perf_counter()
@@ -573,6 +752,17 @@ def main() -> None:
         resolution=args.grid_resolution,
     )
     leaf_grid_seconds = time.perf_counter() - plot_start
+    plot_start = time.perf_counter()
+    resolved_tree_contour_scale = save_tree_contour(
+        leaf_grid,
+        title="Adaptive regression tree prediction",
+        out_path=output_dir / "tree_prediction_contour.png",
+        levels=args.contour_levels,
+        scale=args.contour_scale,
+        dynamic_range_threshold=args.contour_dynamic_range_threshold,
+        symlog_linthresh=args.symlog_linthresh,
+    )
+    tree_contour_plot_seconds = time.perf_counter() - plot_start
     plot_start = time.perf_counter()
     save_tree_leaf_regions(
         tree,
@@ -617,12 +807,17 @@ def main() -> None:
         f"resolved_domain_bounds: {domain.bounds.tolist()}",
         f"dimension: {DIMENSION}",
         f"leaf_model: {type(model).__name__}",
+        f"resolved_splitter: {type(builder.splitter).__name__}",
         f"leaf_include_bias: {leaf_include_bias}",
+        f"min_side_points_policy: {min_side_points_policy}",
+        f"resolved_min_side_points: {min_side_points}",
         f"target_samples_per_node: {builder.target_samples}",
+        f"tree_artifact: {tree_path}",
         f"resolved_contour_scale: {resolved_contour_scale}",
-        "temperature_strategy: tune_root",
-        "store_diagnostics: True",
-        "store_samples: False",
+        f"resolved_tree_contour_scale: {resolved_tree_contour_scale}",
+        f"resolved_temperature_strategy: {tree.metadata.get('temperature_strategy')}",
+        f"store_diagnostics: {args.store_diagnostics}",
+        f"store_samples: {args.store_samples}",
         "",
         "[target]",
         *(f"{key}: {value}" for key, value in target_metadata.items()),
@@ -634,6 +829,12 @@ def main() -> None:
         f"test_median_pointwise_relative_error: {test_median_relative:.12e}",
         f"test_max_pointwise_relative_error: {test_max_relative:.12e}",
         f"test_max_absolute_error: {test_max_absolute:.12e}",
+        "",
+        "[test_oracle_range]",
+        f"sample_count: {args.n_test}",
+        f"estimated_min: {test_oracle_min:.12e}",
+        f"estimated_max: {test_oracle_max:.12e}",
+        f"estimated_span: {test_oracle_max - test_oracle_min:.12e}",
         "",
         "[tree]",
         f"oracle_queries: {build_result.oracle_queries}",
@@ -649,14 +850,22 @@ def main() -> None:
         "",
         "[timing_seconds]",
         f"tree_build: {build_seconds:.6f}",
+        f"tree_save: {tree_save_seconds:.6f}",
         f"test_sampling: {test_sampling_seconds:.6f}",
         f"test_oracle_evaluation: {test_oracle_seconds:.6f}",
         f"tree_prediction: {prediction_seconds:.6f}",
         f"predictions_per_second: {args.n_test / max(prediction_seconds, 1e-12):.3f}",
         f"contour_plot: {contour_plot_seconds:.6f}",
         f"leaf_grid_routing: {leaf_grid_seconds:.6f}",
+        f"tree_contour_plot: {tree_contour_plot_seconds:.6f}",
         f"leaf_region_plot: {leaf_plot_seconds:.6f}",
         f"leaf_error_plot: {leaf_error_plot_seconds:.6f}",
+        "",
+        "[build_timing_profile]",
+        *build_timing_report_lines(
+            build_result.build_timing,
+            include_model_refits=args.splitter != "hrt",
+        ),
         "",
         "[leaf_status_counts]",
         *(f"{status}: {leaf_statuses.get(status, 0)}" for status in expected_leaf_statuses),
@@ -674,6 +883,15 @@ def main() -> None:
         "",
         "[split_warning_counts]",
         *(f"{warning}: {count}" for warning, count in sorted(split_warnings.items())),
+        "",
+        "[node_warning_counts]",
+        *(f"{warning}: {count}" for warning, count in sorted(node_warnings.items())),
+        "",
+        "[sampling_warnings]",
+        (
+            "covariance_eigenvalue_floor_saturated: "
+            f"{sampling_warnings.get('covariance_eigenvalue_floor_saturated', 0)}"
+        ),
     ]
     report_path = output_dir / "report.txt"
     report_path.write_text("\n".join(report_lines) + "\n")
@@ -690,9 +908,28 @@ def main() -> None:
                 "status": node.status,
                 "fit_error": node.metadata.get("fit_error"),
                 "fit_mse": node.metadata.get("fit_mse"),
+                "fit_solver_requested": node.metadata.get("fit_solver_requested"),
+                "fit_solver_used": node.metadata.get("fit_solver_used"),
+                "fit_condition_estimator": node.metadata.get(
+                    "fit_condition_estimator"
+                ),
+                "fit_cond_estimate": node.metadata.get("fit_cond_estimate"),
+                "fit_fallback_reason": node.metadata.get("fit_fallback_reason"),
                 "n_samples": node.metadata.get("n_samples"),
                 "n_inherited": node.metadata.get("n_inherited"),
                 "n_new": node.metadata.get("n_new"),
+                "sampling_method": node.metadata.get("sampling_method"),
+                "sampling_thinning": node.metadata.get("sampling_thinning"),
+                "sampling_pilot_length": node.metadata.get("sampling_pilot_length"),
+                "sampling_covariance_condition_number": node.metadata.get(
+                    "sampling_covariance_condition_number"
+                ),
+                "sampling_covariance_floor_saturated": node.metadata.get(
+                    "sampling_covariance_floor_saturated"
+                ),
+                "sampling_warnings": ";".join(
+                    node.metadata.get("sampling_warnings", ())
+                ),
                 "split_gain_mse": node.metadata.get("split_gain_mse"),
                 "relative_split_gain_mse": node.metadata.get("relative_split_gain_mse"),
                 "split_stop_reason": node.metadata.get("split_stop_reason"),

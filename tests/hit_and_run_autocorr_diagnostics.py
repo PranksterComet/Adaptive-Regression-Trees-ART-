@@ -17,7 +17,9 @@ from art.domain import BoxDomain, PolytopeRegion
 from art.sampling import (
     HitAndRunSampler,
     autocorrelation_by_lag,
+    floor_covariance_eigenvalues,
     make_thinning_candidates,
+    sample_covariance_eigendecomposition,
 )
 
 
@@ -123,7 +125,7 @@ def save_chain_scatter(chain: np.ndarray, out_path: Path) -> None:
     plt.gca().set_aspect("equal", adjustable="box")
     plt.xlabel("x1")
     plt.ylabel("x2")
-    plt.title("Hit-and-run pilot chain")
+    plt.title("Hit-and-run diagnostic chain")
     plt.grid(True, alpha=0.25)
     plt.tight_layout()
     plt.savefig(out_path, dpi=200)
@@ -211,6 +213,27 @@ def main() -> None:
     parser.add_argument("--acf-threshold", type=float, default=0.1)
     parser.add_argument("--stable-window", type=int, default=3)
     parser.add_argument("--num-random-probes", type=int, default=6)
+    parser.add_argument(
+        "--covariance-sampling",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Estimate a covariance spectrum from an ordinary pilot chain, then "
+            "generate the diagnostic chain with covariance-shaped directions."
+        ),
+    )
+    parser.add_argument(
+        "--direction-eigenvalue-floor",
+        type=float,
+        default=1e-2,
+        help="Trace-scaled floor ratio applied to covariance eigenvalues.",
+    )
+    parser.add_argument(
+        "--covariance-pilot-multiplier",
+        type=int,
+        default=50,
+        help="Number of covariance pilot samples per input dimension.",
+    )
     parser.add_argument("--slab-width", type=float, default=0.25)
     parser.add_argument("--random-cuts", type=int, default=None)
     parser.add_argument("--cut-bound-low", type=float, default=0.2)
@@ -230,6 +253,10 @@ def main() -> None:
         raise ValueError("--max-lag must be at least 1.")
     if args.num_random_probes < 0:
         raise ValueError("--num-random-probes must be nonnegative.")
+    if not np.isfinite(args.direction_eigenvalue_floor) or args.direction_eigenvalue_floor <= 0.0:
+        raise ValueError("--direction-eigenvalue-floor must be positive.")
+    if args.covariance_pilot_multiplier < 1:
+        raise ValueError("--covariance-pilot-multiplier must be at least 1.")
     if args.slab_width <= 0.0:
         raise ValueError("--slab-width must be positive.")
     if args.random_cuts is not None and args.random_cuts < 0:
@@ -240,6 +267,7 @@ def main() -> None:
         raise ValueError("--cut-bound-low must be at most --cut-bound-high.")
 
     rng = np.random.default_rng(args.seed)
+    probe_rng = np.random.default_rng(np.random.SeedSequence([args.seed, 1]))
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -256,14 +284,54 @@ def main() -> None:
         cut_bound_high=args.cut_bound_high,
         rotated_width_ratio=args.rotated_width_ratio,
     )
-    chain = HitAndRunSampler(burn_in=0, thinning=1).sample(
+    sampler = HitAndRunSampler(
+        burn_in=0,
+        thinning=1,
+        direction_eigenvalue_floor=args.direction_eigenvalue_floor,
+    )
+    pilot_chain = None
+    covariance_eigenvalues = None
+    floored_eigenvalues = None
+    eigenvalue_floor = None
+    covariance_condition_number = None
+    covariance_floor_saturated = False
+
+    if args.covariance_sampling:
+        covariance_pilot_steps = args.covariance_pilot_multiplier * args.dim
+        pilot_chain = sampler.sample(
+            region,
+            n=covariance_pilot_steps,
+            random_state=rng,
+            x0=x0,
+        )
+        eigenvectors, covariance_eigenvalues = sample_covariance_eigendecomposition(pilot_chain)
+        floored_eigenvalues, eigenvalue_floor = floor_covariance_eigenvalues(
+            covariance_eigenvalues,
+            args.direction_eigenvalue_floor,
+        )
+        covariance_condition_number = float(
+            np.max(floored_eigenvalues) / np.min(floored_eigenvalues)
+        )
+        covariance_floor_saturated = bool(
+            np.any(covariance_eigenvalues <= eigenvalue_floor)
+        )
+        sampler = HitAndRunSampler(
+            burn_in=0,
+            thinning=1,
+            direction_eigenvectors=eigenvectors,
+            direction_eigenvalues=covariance_eigenvalues,
+            direction_eigenvalue_floor=args.direction_eigenvalue_floor,
+        )
+        x0 = pilot_chain[-1]
+
+    chain = sampler.sample(
         region,
         n=args.n_steps,
         random_state=rng,
         x0=x0,
     )
 
-    probes, labels = make_probe_matrix(args.dim, args.num_random_probes, rng)
+    probes, labels = make_probe_matrix(args.dim, args.num_random_probes, probe_rng)
     lags = make_thinning_candidates(min(args.max_lag, chain.shape[0] // 2), mode=args.candidate_mode)
     probe_series = chain @ probes.T
     autocorr = autocorrelation_by_lag(probe_series, lags)
@@ -292,6 +360,23 @@ def main() -> None:
             "dimension": args.dim,
             "n_constraints": region.A.shape[0],
             "n_steps": args.n_steps,
+            "covariance_sampling": args.covariance_sampling,
+            "covariance_pilot_multiplier": args.covariance_pilot_multiplier,
+            "covariance_pilot_steps": (
+                args.covariance_pilot_multiplier * args.dim
+                if args.covariance_sampling
+                else 0
+            ),
+            "direction_eigenvalue_floor_ratio": args.direction_eigenvalue_floor,
+            "covariance_eigenvalue_floor": eigenvalue_floor,
+            "covariance_condition_number": covariance_condition_number,
+            "covariance_floor_saturated": covariance_floor_saturated,
+            "covariance_eigenvalues": (
+                covariance_eigenvalues.tolist() if covariance_eigenvalues is not None else None
+            ),
+            "floored_covariance_eigenvalues": (
+                floored_eigenvalues.tolist() if floored_eigenvalues is not None else None
+            ),
             "max_lag": args.max_lag,
             "candidate_mode": args.candidate_mode,
             "acf_threshold": args.acf_threshold,

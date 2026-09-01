@@ -7,7 +7,14 @@ from typing import Any
 
 import numpy as np
 
-from .models import RegressionModel, WeightedRegressionModel
+from .models import (
+    PreparedDesign,
+    PreparedFeatureModel,
+    RegressionModel,
+    WeightedRegressionModel,
+    ridge_solve_diagnostics,
+)
+from .timing import BuildTimingProfile
 
 
 def sigmoid(values: np.ndarray) -> np.ndarray:
@@ -20,7 +27,6 @@ class SoftObjectiveResult:
     """Cached evaluation state for one soft-oblique candidate."""
 
     theta: np.ndarray
-    X: np.ndarray
     left_model: RegressionModel
     right_model: RegressionModel
     pi: np.ndarray
@@ -37,33 +43,65 @@ class SoftObliqueRidgeObjective:
 
     temperature: float
     model_template: WeightedRegressionModel
+    X: np.ndarray
+    y: np.ndarray
     weight_floor: float = 1e-12
+    prepared_design: PreparedDesign | None = None
+    timing_profile: BuildTimingProfile | None = field(
+        default=None,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        self.X = np.asarray(self.X, dtype=float)
+        self.y = np.asarray(self.y, dtype=float).reshape(-1)
+        if self.X.ndim != 2:
+            raise ValueError(f"X must have shape (n, d), got {self.X.shape}.")
+        if self.X.shape[0] != self.y.shape[0]:
+            raise ValueError(
+                f"X and y length mismatch: {self.X.shape[0]} != {self.y.shape[0]}."
+            )
+        if self.temperature <= 0.0:
+            raise ValueError("temperature must be positive.")
+        if not hasattr(self.model_template, "fit_weighted"):
+            raise TypeError("model_template must provide fit_weighted(X, y, weights).")
+        if self.prepared_design is not None:
+            if not isinstance(self.model_template, PreparedFeatureModel):
+                raise TypeError(
+                    "prepared_design requires a PreparedFeatureModel template."
+                )
+            if self.prepared_design.n_samples != self.X.shape[0]:
+                raise ValueError(
+                    "Prepared design and X must have the same number of rows."
+                )
+            if self.prepared_design.input_dimension != self.X.shape[1]:
+                raise ValueError(
+                    "Prepared design input dimension does not match X."
+                )
 
     def evaluate(
         self,
         theta: np.ndarray,
-        X: np.ndarray,
-        y: np.ndarray,
         reference: SoftObjectiveResult | None = None,
     ) -> SoftObjectiveResult:
         """Evaluate shared candidate state, optionally reusing fitted models."""
 
-        theta, X, y = self._validate_inputs(theta, X, y)
+        theta = self._validate_theta(theta)
         w = theta[:-1]
         z = float(theta[-1])
-        pi = sigmoid((X @ w - z) / self.temperature)
+        pi = sigmoid((self.X @ w - z) / self.temperature)
 
         if reference is None:
-            left_model, right_model = self._fit_models(X, y, pi)
+            left_model, right_model = self._fit_models(pi)
+            residual_left = self.y - self._predict_model(left_model)
+            residual_right = self.y - self._predict_model(right_model)
         else:
             left_model = reference.left_model
             right_model = reference.right_model
-
-        residual_left = y - left_model.predict(X)
-        residual_right = y - right_model.predict(X)
+            residual_left = reference.residual_left
+            residual_right = reference.residual_right
         return SoftObjectiveResult(
             theta=theta.copy(),
-            X=X,
             left_model=left_model,
             right_model=right_model,
             pi=pi,
@@ -76,18 +114,19 @@ class SoftObliqueRidgeObjective:
                 "min_pi": float(np.min(pi)),
                 "max_pi": float(np.max(pi)),
                 "models_refit": reference is None,
+                "prepared_design": self.prepared_design is not None,
+                "left_solve": ridge_solve_diagnostics(left_model),
+                "right_solve": ridge_solve_diagnostics(right_model),
             },
         )
 
     def value(
         self,
         evaluation_or_theta: SoftObjectiveResult | np.ndarray,
-        X: np.ndarray | None = None,
-        y: np.ndarray | None = None,
     ) -> float:
-        """Return a cached loss or evaluate one from theta, X, and y."""
+        """Return a cached loss or evaluate one from theta."""
 
-        evaluation = self._resolve_evaluation(evaluation_or_theta, X, y)
+        evaluation = self._resolve_evaluation(evaluation_or_theta)
         if evaluation.loss is None:
             evaluation.loss = self._loss(
                 evaluation.pi,
@@ -103,7 +142,6 @@ class SoftObliqueRidgeObjective:
             raise TypeError("evaluation must be a SoftObjectiveResult.")
         if evaluation.grad is None:
             evaluation.grad = self._gradient(
-                evaluation.X,
                 evaluation.pi,
                 evaluation.residual_left,
                 evaluation.residual_right,
@@ -113,38 +151,72 @@ class SoftObliqueRidgeObjective:
     def value_and_grad(
         self,
         theta: np.ndarray,
-        X: np.ndarray,
-        y: np.ndarray,
         reference: SoftObjectiveResult | None = None,
     ) -> SoftObjectiveResult:
         """Evaluate a candidate and populate both cached loss and gradient."""
 
-        evaluation = self.evaluate(theta, X, y, reference=reference)
+        evaluation = self.evaluate(theta, reference=reference)
         self.value(evaluation)
         self.grad(evaluation)
         return evaluation
 
     def _fit_models(
         self,
-        X: np.ndarray,
-        y: np.ndarray,
+        pi: np.ndarray,
+    ) -> tuple[RegressionModel, RegressionModel]:
+        if self.timing_profile is None:
+            return self._fit_models_untimed(pi)
+        with self.timing_profile.measure("model_refit"):
+            return self._fit_models_untimed(pi)
+
+    def _fit_models_untimed(
+        self,
         pi: np.ndarray,
     ) -> tuple[RegressionModel, RegressionModel]:
         left_model = self.model_template.clone()
         right_model = self.model_template.clone()
-        left_model.fit_weighted(
-            X,
-            y,
-            weights=1.0 - pi,
-            weight_floor=self.weight_floor,
-        )
-        right_model.fit_weighted(
-            X,
-            y,
-            weights=pi,
-            weight_floor=self.weight_floor,
-        )
+        if self.prepared_design is None:
+            left_model.fit_weighted(
+                self.X,
+                self.y,
+                weights=1.0 - pi,
+                weight_floor=self.weight_floor,
+            )
+            right_model.fit_weighted(
+                self.X,
+                self.y,
+                weights=pi,
+                weight_floor=self.weight_floor,
+            )
+        else:
+            if not isinstance(left_model, PreparedFeatureModel) or not isinstance(
+                right_model, PreparedFeatureModel
+            ):
+                raise TypeError(
+                    "Prepared objective models must implement PreparedFeatureModel."
+                )
+            left_model.fit_weighted_design(
+                self.prepared_design,
+                self.y,
+                weights=1.0 - pi,
+                weight_floor=self.weight_floor,
+            )
+            right_model.fit_weighted_design(
+                self.prepared_design,
+                self.y,
+                weights=pi,
+                weight_floor=self.weight_floor,
+            )
         return left_model, right_model
+
+    def _predict_model(self, model: RegressionModel) -> np.ndarray:
+        if self.prepared_design is None:
+            return model.predict(self.X)
+        if not isinstance(model, PreparedFeatureModel):
+            raise TypeError(
+                "Prepared objective models must implement PreparedFeatureModel."
+            )
+        return model.predict_design(self.prepared_design)
 
     def _loss(
         self,
@@ -159,53 +231,37 @@ class SoftObliqueRidgeObjective:
 
     def _gradient(
         self,
-        X: np.ndarray,
         pi: np.ndarray,
         residual_left: np.ndarray,
         residual_right: np.ndarray,
     ) -> np.ndarray:
-        n = X.shape[0]
+        n = self.X.shape[0]
         coeff = (
             (residual_right**2 - residual_left**2)
             * pi
             * (1.0 - pi)
             / n
         )
-        grad_w = X.T @ coeff / self.temperature
+        grad_w = self.X.T @ coeff / self.temperature
         grad_z = -float(np.sum(coeff)) / self.temperature
         return np.concatenate([grad_w, np.array([grad_z])])
 
     def _resolve_evaluation(
         self,
         evaluation_or_theta: SoftObjectiveResult | np.ndarray,
-        X: np.ndarray | None,
-        y: np.ndarray | None,
     ) -> SoftObjectiveResult:
         if isinstance(evaluation_or_theta, SoftObjectiveResult):
-            if X is not None or y is not None:
-                raise ValueError("X and y must be omitted when passing an evaluation.")
             return evaluation_or_theta
-        if X is None or y is None:
-            raise ValueError("X and y are required when passing theta.")
-        return self.evaluate(evaluation_or_theta, X, y)
+        return self.evaluate(evaluation_or_theta)
 
-    def _validate_inputs(
+    def _validate_theta(
         self,
         theta: np.ndarray,
-        X: np.ndarray,
-        y: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> np.ndarray:
         theta = np.asarray(theta, dtype=float).reshape(-1)
-        X = np.asarray(X, dtype=float)
-        y = np.asarray(y, dtype=float).reshape(-1)
-        if X.ndim != 2:
-            raise ValueError(f"X must have shape (n, d), got {X.shape}.")
-        if theta.shape[0] != X.shape[1] + 1:
-            raise ValueError(f"theta must have length {X.shape[1] + 1}, got {theta.shape[0]}.")
-        if X.shape[0] != y.shape[0]:
-            raise ValueError(f"X and y length mismatch: {X.shape[0]} != {y.shape[0]}.")
-        if self.temperature <= 0.0:
-            raise ValueError("temperature must be positive.")
-        if not hasattr(self.model_template, "fit_weighted"):
-            raise TypeError("model_template must provide fit_weighted(X, y, weights).")
-        return theta, X, y
+        if theta.shape[0] != self.X.shape[1] + 1:
+            raise ValueError(
+                f"theta must have length {self.X.shape[1] + 1}, "
+                f"got {theta.shape[0]}."
+            )
+        return theta

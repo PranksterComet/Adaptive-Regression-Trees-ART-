@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass, field
+from contextlib import nullcontext
+from dataclasses import dataclass, field, replace
+from time import perf_counter
 from typing import Callable
 
 import numpy as np
@@ -12,11 +14,21 @@ from .domain import BoxDomain, PolytopeRegion, split_region
 from .metrics import mean_squared_error, relative_l2_error
 from .models import (
     AffineRidgeModel,
+    MODEL_CONDITION_WARNING_THRESHOLD,
+    PreparedDesign,
+    PreparedFeatureModel,
     RegressionModel,
     WeightedRegressionModel,
     model_effective_dimension,
+    ridge_solve_diagnostics,
 )
-from .sampling import HitAndRunSampler, Sampler, sample_uniform_box
+from .sampling import (
+    HitAndRunSampler,
+    Sampler,
+    floor_covariance_eigenvalues,
+    sample_covariance_eigendecomposition,
+    sample_uniform_box,
+)
 from .splitters import (
     HingeAffineSplitter,
     SoftObliqueSplitter,
@@ -25,6 +37,7 @@ from .splitters import (
     Splitter,
 )
 from .temperature import TemperatureConfig, estimate_temperature
+from .timing import BuildTimingCategory, BuildTimingProfile
 from .tree import LeafNode, RegressionTree, SplitNode, TreeNode
 
 
@@ -37,6 +50,7 @@ class TreeBuildResult:
     tree: RegressionTree
     oracle_queries: int
     restarts_on_failure: int
+    build_timing: dict[str, float] | None = None
 
 
 @dataclass
@@ -45,6 +59,7 @@ class _NodeSamples:
     y: np.ndarray
     n_inherited: int
     n_new: int
+    sampling_metadata: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -65,12 +80,15 @@ class RegressionTreeBuilder:
     )
     root_sampler: Sampler = field(default_factory=HitAndRunSampler)
     exact_box_root: bool = True
+    isotropic_sampling: bool = True
+    isotropic_pilot_multiplier: int = 50
     temperature_config: TemperatureConfig | None = None
     min_split_gain: float = 0.0
     min_relative_split_gain: float = 0.0
     max_retries_on_failure: int = 0
     store_samples: bool = False
     store_diagnostics: bool = False
+    profile_build_timing: bool = False
     oracle_vectorized: bool = False
     random_state: int | np.random.Generator | None = None
 
@@ -80,6 +98,11 @@ class RegressionTreeBuilder:
     _root_temperature_c: float | None = field(default=None, init=False, repr=False)
     _target_samples: int = field(init=False, repr=False)
     _effective_dimension: int | None = field(init=False, repr=False)
+    _timing_profile: BuildTimingProfile | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         if self.error_threshold < 0.0:
@@ -92,6 +115,21 @@ class RegressionTreeBuilder:
             raise ValueError("Split-gain thresholds must be nonnegative.")
         if self.max_retries_on_failure < 0:
             raise ValueError("max_retries_on_failure must be nonnegative.")
+        if self.isotropic_sampling and self.isotropic_pilot_multiplier < 2:
+            raise ValueError("isotropic_pilot_multiplier must be at least 2.")
+        if self.isotropic_sampling and not isinstance(self.sampler, HitAndRunSampler):
+            raise TypeError("isotropic_sampling requires a HitAndRunSampler.")
+        root_uses_hit_and_run = not (
+            isinstance(self.domain, BoxDomain) and self.exact_box_root
+        )
+        if (
+            self.isotropic_sampling
+            and root_uses_hit_and_run
+            and not isinstance(self.root_sampler, HitAndRunSampler)
+        ):
+            raise TypeError(
+                "isotropic_sampling requires a HitAndRunSampler for non-exact roots."
+            )
         if (
             self.max_retries_on_failure > 0
             and int(getattr(self.splitter, "n_restarts", 1)) != 1
@@ -143,17 +181,22 @@ class RegressionTreeBuilder:
     def build(self) -> TreeBuildResult:
         """Build a fresh tree and reset all per-build state."""
 
+        self._timing_profile = (
+            BuildTimingProfile() if self.profile_build_timing else None
+        )
+        build_start = perf_counter() if self._timing_profile is not None else None
         self.oracle_queries = 0
         self.restarts_on_failure = 0
         self._root_temperature_c = None
         root_region = self.domain.as_region() if isinstance(self.domain, BoxDomain) else self.domain
-        X_root = self._sample_root(root_region)
+        X_root, sampling_metadata = self._sample_root(root_region)
         y_root = self._query_oracle(X_root)
         root_samples = _NodeSamples(
             X=X_root,
             y=y_root,
             n_inherited=0,
             n_new=X_root.shape[0],
+            sampling_metadata=sampling_metadata,
         )
         root = self._build_node(root_region, root_samples, depth=0, node_id="root")
         tree = RegressionTree(
@@ -163,17 +206,25 @@ class RegressionTreeBuilder:
                 "error_metric": self._metric_name(),
                 "error_threshold": self.error_threshold,
                 "effective_dimension": self._effective_dimension,
+                "splitter": type(self.splitter).__name__,
                 "target_samples_per_node": self._target_samples,
                 "restarts_on_failure": self.restarts_on_failure,
+                "isotropic_sampling": self.isotropic_sampling,
+                "isotropic_pilot_multiplier": self.isotropic_pilot_multiplier,
                 "temperature_strategy": (
                     None if self.temperature_config is None else self.temperature_config.strategy
                 ),
             },
         )
+        build_timing = None
+        if self._timing_profile is not None and build_start is not None:
+            build_timing = self._timing_profile.summary(perf_counter() - build_start)
+        tree.metadata["build_timing"] = build_timing
         return TreeBuildResult(
             tree=tree,
             oracle_queries=self.oracle_queries,
             restarts_on_failure=self.restarts_on_failure,
+            build_timing=build_timing,
         )
 
     def _build_node(
@@ -183,11 +234,15 @@ class RegressionTreeBuilder:
         depth: int,
         node_id: str,
     ) -> TreeNode:
-        model = self.model_template.clone().fit(samples.X, samples.y)
-        predictions = model.predict(samples.X)
+        prepared_design = self._prepare_design(samples.X)
+        model, predictions = self._fit_node_model(
+            samples.X,
+            samples.y,
+            prepared_design,
+        )
         fit_error = float(self.error_metric(samples.y, predictions))
         parent_mse = mean_squared_error(samples.y, predictions)
-        base_metadata = self._node_metadata(samples, fit_error, parent_mse)
+        base_metadata = self._node_metadata(samples, fit_error, parent_mse, model)
 
         if fit_error <= self.error_threshold:
             return self._make_leaf(
@@ -205,14 +260,20 @@ class RegressionTreeBuilder:
                 model,
                 parent_mse,
                 depth,
+                prepared_design,
             )
         except SplitNotFoundError as exc:
+            warnings = self._combine_warnings(
+                base_metadata.get("warnings", ()),
+                self._diagnostic_warnings(exc.diagnostics),
+            )
             metadata = {
                 **base_metadata,
                 **exc.context,
                 "split_failure_reason": exc.reason,
                 "restarts_on_failure": exc.restarts_on_failure,
                 "split_attempt_failure_reasons": exc.failure_reasons,
+                "warnings": warnings,
             }
             if self.store_diagnostics and exc.diagnostics is not None:
                 metadata["splitter_metadata"] = copy.deepcopy(exc.diagnostics)
@@ -222,11 +283,16 @@ class RegressionTreeBuilder:
 
         rejection_reason = self._split_rejection_reason(split_result)
         if rejection_reason is not None:
+            warnings = self._combine_warnings(
+                base_metadata.get("warnings", ()),
+                self._split_warnings(split_result),
+            )
             metadata = {
                 **base_metadata,
                 **self._split_summary(split_result),
                 **temperature_metadata,
                 **retry_metadata,
+                "warnings": warnings,
             }
             if self.store_diagnostics:
                 metadata["splitter_metadata"] = copy.deepcopy(split_result.metadata)
@@ -243,6 +309,7 @@ class RegressionTreeBuilder:
             left_tag=f"{node_id}/L",
             right_tag=f"{node_id}/R",
         )
+        del prepared_design
         left = self._build_child(
             left_region,
             samples.X[~right_mask],
@@ -258,7 +325,10 @@ class RegressionTreeBuilder:
             f"{node_id}/R",
         )
 
-        warnings = self._split_warnings(split_result)
+        warnings = self._combine_warnings(
+            base_metadata.get("warnings", ()),
+            self._split_warnings(split_result),
+        )
         metadata = {
             **base_metadata,
             **self._split_summary(split_result),
@@ -292,8 +362,12 @@ class RegressionTreeBuilder:
         try:
             samples = self._top_up_child(region, inherited_X, inherited_y)
         except (RuntimeError, ValueError) as exc:
-            model = self.model_template.clone().fit(inherited_X, inherited_y)
-            predictions = model.predict(inherited_X)
+            prepared_design = self._prepare_design(inherited_X)
+            model, predictions = self._fit_node_model(
+                inherited_X,
+                inherited_y,
+                prepared_design,
+            )
             fallback = _NodeSamples(
                 X=inherited_X,
                 y=inherited_y,
@@ -304,6 +378,7 @@ class RegressionTreeBuilder:
                 fallback,
                 float(self.error_metric(inherited_y, predictions)),
                 mean_squared_error(inherited_y, predictions),
+                model,
             )
             metadata["sampling_error"] = repr(exc)
             return self._make_leaf(
@@ -332,30 +407,34 @@ class RegressionTreeBuilder:
         n_inherited = inherited_X.shape[0]
         n_new = self._target_samples - n_inherited
         if n_new == 0:
-            return _NodeSamples(inherited_X, inherited_y, n_inherited, 0)
+            return _NodeSamples(
+                inherited_X,
+                inherited_y,
+                n_inherited,
+                0,
+                sampling_metadata={
+                    "sampling_method": "inherited_only",
+                    "sampling_thinning": None,
+                    "sampling_pilot_length": 0,
+                    "sampling_covariance_condition_number": None,
+                    "sampling_warnings": (),
+                },
+            )
 
         x0 = inherited_X[int(self._rng.integers(0, n_inherited))]
-        X_new = np.asarray(
-            self.sampler.sample(
-                region,
-                n_new,
-                random_state=self._next_seed(),
-                x0=x0,
-            ),
-            dtype=float,
+        X_new, sampling_metadata = self._sample_region(
+            region,
+            n_new,
+            x0=x0,
+            sampler=self.sampler,
         )
-        if X_new.shape != (n_new, self.dimension):
-            raise RuntimeError(
-                f"Sampler returned shape {X_new.shape}; expected {(n_new, self.dimension)}."
-            )
-        if not np.all(region.contains(X_new)):
-            raise RuntimeError("Sampler returned points outside the child region.")
         y_new = self._query_oracle(X_new)
         return _NodeSamples(
             X=np.vstack([inherited_X, X_new]),
             y=np.concatenate([inherited_y, y_new]),
             n_inherited=n_inherited,
             n_new=n_new,
+            sampling_metadata=sampling_metadata,
         )
 
     def _fit_split(
@@ -365,9 +444,10 @@ class RegressionTreeBuilder:
         parent_model: RegressionModel,
         parent_mse: float,
         depth: int,
+        prepared_design: PreparedDesign | None,
     ) -> tuple[SplitResult, dict[str, object], dict[str, object]]:
         temperature, temperature_metadata, temperature_tuned = (
-            self._resolve_split_temperature(X, y, depth)
+            self._resolve_split_temperature(X, y, depth, prepared_design)
         )
         allowed_retries = 0 if temperature_tuned else self.max_retries_on_failure
         failure_reasons = []
@@ -381,6 +461,7 @@ class RegressionTreeBuilder:
                     parent_model,
                     parent_mse,
                     temperature,
+                    prepared_design,
                 )
             except SplitNotFoundError as exc:
                 failure_reasons.append(exc.reason)
@@ -420,6 +501,7 @@ class RegressionTreeBuilder:
         X: np.ndarray,
         y: np.ndarray,
         depth: int,
+        prepared_design: PreparedDesign | None,
     ) -> tuple[float | None, dict[str, object], bool]:
         config = self.temperature_config
         if config is None or config.strategy == "splitter":
@@ -442,7 +524,7 @@ class RegressionTreeBuilder:
             c = self._root_temperature_c
             temperature_tuned = False
         else:
-            c, candidate_scores = self._tune_temperature(X, y)
+            c, candidate_scores = self._tune_temperature(X, y, prepared_design)
             temperature_tuned = True
             if config.strategy == "tune_root" and depth == 0:
                 self._root_temperature_c = c
@@ -462,6 +544,7 @@ class RegressionTreeBuilder:
         self,
         X: np.ndarray,
         y: np.ndarray,
+        prepared_design: PreparedDesign | None,
     ) -> tuple[float, list[dict[str, object]]]:
         config = self.temperature_config
         n_val = max(1, int(round(config.validation_fraction * X.shape[0])))
@@ -470,8 +553,18 @@ class RegressionTreeBuilder:
         fit_idx = permutation[n_val:]
         X_fit, y_fit = X[fit_idx], y[fit_idx]
         X_val, y_val = X[val_idx], y[val_idx]
-        parent_model = self.model_template.clone().fit(X_fit, y_fit)
-        parent_mse = mean_squared_error(y_fit, parent_model.predict(X_fit))
+        fit_design = (
+            None if prepared_design is None else prepared_design.subset(fit_idx)
+        )
+        validation_design = (
+            None if prepared_design is None else prepared_design.subset(val_idx)
+        )
+        parent_model, parent_predictions = self._fit_node_model(
+            X_fit,
+            y_fit,
+            fit_design,
+        )
+        parent_mse = mean_squared_error(y_fit, parent_predictions)
         comparison_seed = self._next_seed()
         temperature_seed = self._next_seed()
         candidates = []
@@ -488,6 +581,7 @@ class RegressionTreeBuilder:
                     parent_model,
                     parent_mse,
                     temperature,
+                    fit_design,
                     random_seed=comparison_seed,
                 )
             except SplitNotFoundError as exc:
@@ -513,9 +607,12 @@ class RegressionTreeBuilder:
                 )
                 continue
 
-            validation_mse = mean_squared_error(
-                y_val, result.predict(X_val)
+            validation_predictions = (
+                result.predict(X_val)
+                if validation_design is None
+                else result.predict_prepared(X_val, validation_design)
             )
+            validation_mse = mean_squared_error(y_val, validation_predictions)
             candidates.append(
                 {
                     "c": c,
@@ -541,6 +638,7 @@ class RegressionTreeBuilder:
         parent_model: RegressionModel,
         parent_mse: float,
         temperature: float | None,
+        prepared_design: PreparedDesign | None,
         random_seed: int | None = None,
     ) -> SplitResult:
         node_splitter = copy.deepcopy(self.splitter)
@@ -552,12 +650,38 @@ class RegressionTreeBuilder:
                 "random_state",
                 self._next_seed() if random_seed is None else random_seed,
             )
-        return node_splitter.split(
-            X,
-            y,
-            parent_model=parent_model,
-            parent_loss=parent_mse,
-        )
+        if isinstance(node_splitter, SoftObliqueSplitter):
+            node_splitter._timing_profile = self._timing_profile
+        split_kwargs: dict[str, object] = {
+            "parent_model": parent_model,
+            "parent_loss": parent_mse,
+        }
+        if prepared_design is not None:
+            split_kwargs["prepared_design"] = prepared_design
+        with self._timing_context("splitter"):
+            return node_splitter.split(X, y, **split_kwargs)
+
+    def _prepare_design(self, X: np.ndarray) -> PreparedDesign | None:
+        if not isinstance(self.model_template, PreparedFeatureModel):
+            return None
+        return self.model_template.prepare_design(X)
+
+    def _fit_node_model(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        prepared_design: PreparedDesign | None,
+    ) -> tuple[RegressionModel, np.ndarray]:
+        model = self.model_template.clone()
+        if prepared_design is None:
+            model.fit(X, y)
+            return model, model.predict(X)
+        if not isinstance(model, PreparedFeatureModel):
+            raise TypeError(
+                "A prepared design requires clones implementing PreparedFeatureModel."
+            )
+        model.fit_design(prepared_design, y)
+        return model, model.predict_design(prepared_design)
 
     def _temperature_for_c(
         self,
@@ -607,13 +731,43 @@ class RegressionTreeBuilder:
 
     def _split_warnings(self, result: SplitResult) -> tuple[str, ...]:
         warnings = []
+        if result.n_iters == 0 and result.stop_reason == "gradient_tolerance":
+            warnings.append("small_init_grad")
         if not result.converged:
             warnings.append(result.stop_reason)
         if bool(result.metadata.get("alpha_min_saturated", False)):
             warnings.append("alpha_min_saturated")
         if bool(result.metadata.get("alpha_max_saturated", False)):
             warnings.append("alpha_max_saturated")
+        if bool(result.metadata.get("high_model_conditioning", False)):
+            warnings.append("high_model_conditioning")
         return tuple(dict.fromkeys(warnings))
+
+    def _diagnostic_warnings(
+        self,
+        diagnostics: dict[str, object] | None,
+    ) -> tuple[str, ...]:
+        if diagnostics is None:
+            return ()
+        warnings = []
+        if (
+            diagnostics.get("n_iters") == 0
+            and diagnostics.get("stop_reason") == "gradient_tolerance"
+        ):
+            warnings.append("small_init_grad")
+        if bool(diagnostics.get("high_model_conditioning", False)):
+            warnings.append("high_model_conditioning")
+        return tuple(warnings)
+
+    @staticmethod
+    def _combine_warnings(*groups: object) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                warning
+                for group in groups
+                for warning in group
+            )
+        )
 
     def _split_summary(self, result: SplitResult) -> dict[str, object]:
         return {
@@ -632,7 +786,16 @@ class RegressionTreeBuilder:
         samples: _NodeSamples,
         fit_error: float,
         fit_mse: float,
+        model: RegressionModel,
     ) -> dict[str, object]:
+        solve = ridge_solve_diagnostics(model)
+        cond_estimate = None if solve is None else solve.get("cond_estimate")
+        warnings = (
+            ("high_model_conditioning",)
+            if cond_estimate is not None
+            and float(cond_estimate) >= MODEL_CONDITION_WARNING_THRESHOLD
+            else ()
+        )
         return {
             "fit_error": fit_error,
             "fit_error_metric": self._metric_name(),
@@ -640,6 +803,23 @@ class RegressionTreeBuilder:
             "n_samples": samples.X.shape[0],
             "n_inherited": samples.n_inherited,
             "n_new": samples.n_new,
+            "fit_solver_requested": (
+                None if solve is None else solve.get("solver_requested")
+            ),
+            "fit_solver_used": None if solve is None else solve.get("solver_used"),
+            "fit_condition_estimator": (
+                None if solve is None else solve.get("condition_estimator")
+            ),
+            "fit_cond_estimate": cond_estimate,
+            "fit_ridge_effective": (
+                None if solve is None else solve.get("ridge_effective")
+            ),
+            "fit_rank": None if solve is None else solve.get("rank"),
+            "fit_fallback_reason": (
+                None if solve is None else solve.get("fallback_reason")
+            ),
+            "warnings": warnings,
+            **samples.sampling_metadata,
         }
 
     def _make_leaf(
@@ -672,28 +852,148 @@ class RegressionTreeBuilder:
             metadata["X"] = samples.X.copy()
             metadata["y"] = samples.y.copy()
 
-    def _sample_root(self, region: PolytopeRegion) -> np.ndarray:
+    def _sample_root(
+        self,
+        region: PolytopeRegion,
+    ) -> tuple[np.ndarray, dict[str, object]]:
         if isinstance(self.domain, BoxDomain) and self.exact_box_root:
-            return sample_uniform_box(
-                self.domain.bounds,
-                self._target_samples,
-                random_state=self._next_seed(),
+            with self._timing_context("sampling"):
+                X = sample_uniform_box(
+                    self.domain.bounds,
+                    self._target_samples,
+                    random_state=self._next_seed(),
+                )
+            return (
+                X,
+                {
+                    "sampling_method": "exact_uniform_box",
+                    "sampling_thinning": None,
+                    "sampling_pilot_length": 0,
+                    "sampling_covariance_condition_number": None,
+                    "sampling_warnings": (),
+                },
             )
-        X = np.asarray(
-            self.root_sampler.sample(
-                region,
-                self._target_samples,
-                random_state=self._next_seed(),
-                x0=None,
-            ),
-            dtype=float,
+        return self._sample_region(
+            region,
+            self._target_samples,
+            x0=None,
+            sampler=self.root_sampler,
         )
-        if X.shape != (self._target_samples, self.dimension):
-            raise RuntimeError(
-                f"Root sampler returned shape {X.shape}; "
-                f"expected {(self._target_samples, self.dimension)}."
+
+    def _sample_region(
+        self,
+        region: PolytopeRegion,
+        n: int,
+        *,
+        x0: np.ndarray | None,
+        sampler: Sampler,
+    ) -> tuple[np.ndarray, dict[str, object]]:
+        with self._timing_context("sampling"):
+            return self._sample_region_untimed(
+                region,
+                n,
+                x0=x0,
+                sampler=sampler,
             )
-        return X
+
+    def _sample_region_untimed(
+        self,
+        region: PolytopeRegion,
+        n: int,
+        *,
+        x0: np.ndarray | None,
+        sampler: Sampler,
+    ) -> tuple[np.ndarray, dict[str, object]]:
+        if not self.isotropic_sampling:
+            X = np.asarray(
+                sampler.sample(
+                    region,
+                    n,
+                    random_state=self._next_seed(),
+                    x0=x0,
+                ),
+                dtype=float,
+            )
+            metadata = {
+                "sampling_method": type(sampler).__name__,
+                "sampling_thinning": getattr(sampler, "thinning", None),
+                "sampling_pilot_length": 0,
+                "sampling_covariance_condition_number": None,
+                "sampling_warnings": (),
+            }
+        else:
+            if not isinstance(sampler, HitAndRunSampler):
+                raise TypeError("isotropic_sampling requires a HitAndRunSampler.")
+
+            pilot_length = self.isotropic_pilot_multiplier * self.dimension
+            pilot_sampler = replace(
+                sampler,
+                burn_in=0,
+                thinning=1,
+                direction_eigenvectors=None,
+                direction_eigenvalues=None,
+            )
+            pilot = np.asarray(
+                pilot_sampler.sample(
+                    region,
+                    pilot_length,
+                    random_state=self._next_seed(),
+                    x0=x0,
+                ),
+                dtype=float,
+            )
+            if pilot.shape != (pilot_length, self.dimension):
+                raise RuntimeError(
+                    f"Pilot sampler returned shape {pilot.shape}; "
+                    f"expected {(pilot_length, self.dimension)}."
+                )
+
+            eigenvectors, eigenvalues = sample_covariance_eigendecomposition(pilot)
+            safe_eigenvalues, eigenvalue_floor = floor_covariance_eigenvalues(
+                eigenvalues,
+                sampler.direction_eigenvalue_floor,
+            )
+            floor_saturated = bool(np.any(eigenvalues <= eigenvalue_floor))
+            condition_number = float(
+                np.max(safe_eigenvalues) / np.min(safe_eigenvalues)
+            )
+            node_sampler = replace(
+                sampler,
+                direction_eigenvectors=eigenvectors,
+                direction_eigenvalues=eigenvalues,
+            )
+            X = np.asarray(
+                node_sampler.sample(
+                    region,
+                    n,
+                    random_state=self._next_seed(),
+                    x0=pilot[-1],
+                ),
+                dtype=float,
+            )
+            warning = "covariance_eigenvalue_floor_saturated"
+            metadata = {
+                "sampling_method": "isotropic_hit_and_run",
+                "sampling_thinning": sampler.thinning,
+                "sampling_pilot_length": pilot_length,
+                "sampling_covariance_condition_number": condition_number,
+                "sampling_covariance_eigenvalue_floor": eigenvalue_floor,
+                "sampling_covariance_floor_saturated": floor_saturated,
+                "sampling_warnings": (warning,) if floor_saturated else (),
+            }
+
+        if X.shape != (n, self.dimension):
+            raise RuntimeError(
+                f"Sampler returned shape {X.shape}; expected {(n, self.dimension)}."
+            )
+        if not np.all(region.contains(X)):
+            raise RuntimeError("Sampler returned points outside the region.")
+        return X, metadata
+
+    def _timing_context(self, category: BuildTimingCategory):
+        if self._timing_profile is None:
+            return nullcontext()
+        return self._timing_profile.measure(category)
 
     def _query_oracle(self, X: np.ndarray) -> np.ndarray:
         X = np.asarray(X, dtype=float)

@@ -34,6 +34,8 @@ def run_case(mode: str, bounds: np.ndarray, theta1: np.ndarray, theta2: np.ndarr
     splitter = HingeAffineSplitter(
         mode=mode,
         ridge=1e-8,
+        solver="auto",
+        auto_rcond_threshold=1e-10,
         mu=1.0,
         max_iters=100,
         tol=1e-8,

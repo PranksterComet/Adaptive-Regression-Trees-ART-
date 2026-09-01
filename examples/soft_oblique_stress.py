@@ -16,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from art.domain import BoxDomain
 from art.metrics import mean_squared_error
+from art.models import PreparedDesign, PreparedFeatureModel, WeightedRegressionModel
 from art.sampling import sample_uniform_box
 from art.splitters import SoftObliqueSplitter
 from art.temperature import estimate_temperature
@@ -42,13 +43,14 @@ def run_candidate(
     X_val: np.ndarray,
     y_val: np.ndarray,
     temperature: float,
+    model_template: WeightedRegressionModel,
+    parent_model: WeightedRegressionModel,
+    parent_loss: float,
+    fit_design: PreparedDesign | None,
+    validation_design: PreparedDesign | None,
     args: argparse.Namespace,
     seed: int,
 ):
-    include_bias = model_include_bias(args.degree, args.no_bias)
-    model_template = make_model_template(args.degree, ridge=args.ridge, include_bias=include_bias)
-    parent_model = model_template.clone().fit(X_fit, y_fit)
-    parent_loss = mean_squared_error(y_fit, parent_model.predict(X_fit))
     splitter = SoftObliqueSplitter(
         model_template=model_template.clone(),
         temperature=temperature,
@@ -73,8 +75,19 @@ def run_candidate(
         refit_during_line_search=args.refit_during_line_search,
         random_state=seed,
     )
-    result = splitter.split(X_fit, y_fit, parent_model=parent_model, parent_loss=parent_loss)
-    val_mse = mean_squared_error(y_val, hard_split_predict(X_val, result))
+    result = splitter.split(
+        X_fit,
+        y_fit,
+        parent_model=parent_model,
+        parent_loss=parent_loss,
+        prepared_design=fit_design,
+    )
+    validation_predictions = (
+        hard_split_predict(X_val, result)
+        if validation_design is None
+        else result.predict_prepared(X_val, validation_design)
+    )
+    val_mse = mean_squared_error(y_val, validation_predictions)
     return result, val_mse
 
 
@@ -241,8 +254,8 @@ def main() -> None:
     parser.add_argument(
         "--refit-during-line-search",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Refit weighted models for every Armijo candidate.",
+        default=False,
+        help="Refit weighted models for every Armijo candidate instead of freezing them.",
     )
     args = parser.parse_args()
 
@@ -325,6 +338,29 @@ def main() -> None:
             y_val = target(X_val)
             X_test = sample_uniform_box(domain.bounds, n_test, random_state=trial_rng)
             y_test = target(X_test)
+            model_template = make_model_template(
+                args.degree,
+                ridge=args.ridge,
+                include_bias=include_bias,
+            )
+            fit_design = (
+                model_template.prepare_design(X_fit)
+                if isinstance(model_template, PreparedFeatureModel)
+                else None
+            )
+            validation_design = (
+                model_template.prepare_design(X_val)
+                if isinstance(model_template, PreparedFeatureModel)
+                else None
+            )
+            parent_model = model_template.clone()
+            if fit_design is None:
+                parent_model.fit(X_fit, y_fit)
+                parent_predictions = parent_model.predict(X_fit)
+            else:
+                parent_model.fit_design(fit_design, y_fit)
+                parent_predictions = parent_model.predict_design(fit_design)
+            parent_loss = mean_squared_error(y_fit, parent_predictions)
 
             best = None
             candidates = []
@@ -345,6 +381,11 @@ def main() -> None:
                             X_val,
                             y_val,
                             temperature=temperature,
+                            model_template=model_template,
+                            parent_model=parent_model,
+                            parent_loss=parent_loss,
+                            fit_design=fit_design,
+                            validation_design=validation_design,
                             args=args,
                             seed=trial_seed,
                         )

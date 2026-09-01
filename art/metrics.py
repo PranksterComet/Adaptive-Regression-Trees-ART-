@@ -57,7 +57,32 @@ def median_pointwise_relative_error(
     y_pred: np.ndarray,
     floor: float = 1e-12,
 ) -> float:
-    return float(np.median(pointwise_relative_error(y_true, y_pred, floor=floor)))
+    return float(
+        pointwise_relative_error_quantile(
+            y_true,
+            y_pred,
+            0.5,
+            floor=floor,
+        )
+    )
+
+
+def pointwise_relative_error_quantile(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    quantile: float | np.ndarray,
+    floor: float = 1e-12,
+) -> float | np.ndarray:
+    """Return requested quantiles of the pointwise relative errors."""
+
+    quantile = np.asarray(quantile, dtype=float)
+    if not np.all(np.isfinite(quantile)) or np.any((quantile < 0.0) | (quantile > 1.0)):
+        raise ValueError("quantile must contain finite values in [0, 1].")
+    result = np.quantile(
+        pointwise_relative_error(y_true, y_pred, floor=floor),
+        quantile,
+    )
+    return float(result) if result.ndim == 0 else result
 
 
 def max_pointwise_relative_error(

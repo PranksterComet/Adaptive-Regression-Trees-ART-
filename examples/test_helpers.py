@@ -7,6 +7,7 @@ import numpy as np
 from art.models import (
     AffineRidgeModel,
     PolynomialRidgeModel,
+    RidgeSolver,
     augment_features,
     polynomial_feature_count,
 )
@@ -54,10 +55,26 @@ def random_polynomial_theta(
     return theta / np.sqrt(theta.size)
 
 
-def make_model_template(degree: int, ridge: float, include_bias: bool = True):
+def make_model_template(
+    degree: int,
+    ridge: float,
+    include_bias: bool = True,
+    solver: RidgeSolver = "normal",
+    auto_rcond_threshold: float = 1e-10,
+):
     if degree == 1:
-        return AffineRidgeModel(ridge=ridge)
-    return PolynomialRidgeModel(degree=degree, ridge=ridge, include_bias=include_bias)
+        return AffineRidgeModel(
+            ridge=ridge,
+            solver=solver,
+            auto_rcond_threshold=auto_rcond_threshold,
+        )
+    return PolynomialRidgeModel(
+        degree=degree,
+        ridge=ridge,
+        include_bias=include_bias,
+        solver=solver,
+        auto_rcond_threshold=auto_rcond_threshold,
+    )
 
 
 def affine_values(X: np.ndarray, theta: np.ndarray) -> np.ndarray:

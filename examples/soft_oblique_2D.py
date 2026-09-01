@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from art.domain import BoxDomain
 from art.metrics import mean_squared_error
+from art.models import PreparedFeatureModel
 from art.sampling import sample_uniform_box
 from art.splitters import SoftObliqueSplitter
 
@@ -47,8 +48,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--refit-during-line-search",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Refit weighted models for every Armijo candidate.",
+        default=False,
+        help="Refit weighted models for every Armijo candidate instead of freezing them.",
     )
     parser.add_argument("--train-seed", type=int, default=3, help="Training sample seed.")
     parser.add_argument("--test-seed", type=int, default=4, help="Test sample seed.")
@@ -162,8 +163,19 @@ def main() -> None:
     y_test = target(X_test)
 
     model_template = make_model_template(args.degree, ridge=args.ridge, include_bias=include_bias)
-    parent_model = model_template.clone().fit(X_train, y_train)
-    parent_loss = mean_squared_error(y_train, parent_model.predict(X_train))
+    prepared_design = (
+        model_template.prepare_design(X_train)
+        if isinstance(model_template, PreparedFeatureModel)
+        else None
+    )
+    parent_model = model_template.clone()
+    if prepared_design is None:
+        parent_model.fit(X_train, y_train)
+        parent_predictions = parent_model.predict(X_train)
+    else:
+        parent_model.fit_design(prepared_design, y_train)
+        parent_predictions = parent_model.predict_design(prepared_design)
+    parent_loss = mean_squared_error(y_train, parent_predictions)
 
     splitter = SoftObliqueSplitter(
         model_template=model_template.clone(),
@@ -190,7 +202,13 @@ def main() -> None:
         random_state=args.splitter_seed,
     )
 
-    result = splitter.split(X_train, y_train, parent_model=parent_model, parent_loss=parent_loss)
+    result = splitter.split(
+        X_train,
+        y_train,
+        parent_model=parent_model,
+        parent_loss=parent_loss,
+        prepared_design=prepared_design,
+    )
     y_test_pred = hard_split_predict(X_test, result)
     test_mse = mean_squared_error(y_test, y_test_pred)
     train_misclassified, boundary_sign = boundary_misclassification(

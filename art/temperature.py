@@ -13,7 +13,7 @@ TemperatureMode = Literal["median_nn", "median_pairwise_scaled"]
 NearestNeighborMethod = Literal["kdtree", "bruteforce"]
 TemperatureStrategy = Literal["splitter", "fixed", "tune_root", "tune_node"]
 
-DEFAULT_TEMPERATURE_GRID = (1e-4, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0)
+DEFAULT_TEMPERATURE_GRID = (1e-4, 5e-4, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0)
 
 
 @dataclass(frozen=True)

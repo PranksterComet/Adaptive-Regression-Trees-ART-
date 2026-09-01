@@ -54,6 +54,50 @@ def sample_uniform_box(
     return rng.uniform(lows, highs, size=(int(n), bounds.shape[0]))
 
 
+def sample_covariance_eigendecomposition(
+    samples: np.ndarray,
+    *,
+    assume_centered: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return eigenvectors and eigenvalues of the sample covariance matrix."""
+
+    values = np.asarray(samples, dtype=float)
+    if values.ndim != 2:
+        raise ValueError(f"samples must have shape (n_samples, d), got {values.shape}.")
+    if values.shape[0] < 2:
+        raise ValueError("samples must contain at least two points.")
+    if values.shape[1] < 1:
+        raise ValueError("samples must contain at least one coordinate.")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("samples must contain only finite values.")
+
+    centered = values if assume_centered else values - np.mean(values, axis=0, keepdims=True)
+    covariance = centered.T @ centered / (centered.shape[0] - 1)
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    return eigenvectors, eigenvalues
+
+
+def floor_covariance_eigenvalues(
+    eigenvalues: np.ndarray,
+    floor_ratio: float,
+) -> tuple[np.ndarray, float]:
+    """Apply a trace-scaled positive floor to covariance eigenvalues."""
+
+    values = np.asarray(eigenvalues, dtype=float).reshape(-1)
+    if values.size == 0:
+        raise ValueError("eigenvalues must contain at least one value.")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("eigenvalues must be finite.")
+    if not np.isfinite(floor_ratio) or floor_ratio <= 0.0:
+        raise ValueError("floor_ratio must be positive.")
+
+    mean_eigenvalue = float(np.mean(values))
+    if mean_eigenvalue <= 0.0:
+        raise ValueError("eigenvalues must have a positive mean before flooring.")
+    eigenvalue_floor = float(floor_ratio * mean_eigenvalue)
+    return np.maximum(values, eigenvalue_floor), eigenvalue_floor
+
+
 @dataclass
 class UniformBoxSampler:
     """Exact uniform sampler for axis-aligned boxes."""
@@ -152,6 +196,8 @@ def autocorrelation_by_lag(series: np.ndarray, lags: Sequence[int]) -> np.ndarra
         raise ValueError(f"series must have shape (n_steps,) or (n_steps, n_series), got {values.shape}.")
     if values.shape[0] < 2:
         raise ValueError("series must contain at least two states.")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("series must contain only finite values.")
 
     lags_array = np.asarray(lags, dtype=int).reshape(-1)
     if lags_array.size == 0:
@@ -162,16 +208,20 @@ def autocorrelation_by_lag(series: np.ndarray, lags: Sequence[int]) -> np.ndarra
         raise ValueError("all lags must be smaller than the series length.")
 
     centered = values - np.mean(values, axis=0, keepdims=True)
-    variance = np.mean(centered * centered, axis=0)
+    scales = np.max(np.abs(centered), axis=0)
+    nonconstant = scales > 0.0
+    normalized = np.zeros_like(centered)
+    np.divide(centered, scales, out=normalized, where=nonconstant)
+    variance = np.mean(normalized * normalized, axis=0)
     autocorr = np.zeros((lags_array.size, values.shape[1]), dtype=float)
 
     for i, lag in enumerate(lags_array):
-        lag_covariance = np.mean(centered[:-lag] * centered[lag:], axis=0)
+        lag_covariance = np.mean(normalized[:-lag] * normalized[lag:], axis=0)
         autocorr[i] = np.divide(
             lag_covariance,
             variance,
             out=np.zeros_like(lag_covariance, dtype=float),
-            where=variance > 1e-14,
+            where=nonconstant,
         )
 
     return autocorr
@@ -297,18 +347,26 @@ def _transform_chain_for_acf(
     whiten: bool,
     covariance_floor: float,
 ) -> tuple[np.ndarray, dict[str, object]]:
-    centered = chain - np.mean(chain, axis=0, keepdims=True)
     if not whiten:
-        return centered, {"whitening_eig_floor": None, "whitening_condition_number": None}
+        return chain, {"whitening_eig_floor": None, "whitening_condition_number": None}
 
-    cov = centered.T @ centered / max(centered.shape[0] - 1, 1)
-    eigvals, eigvecs = np.linalg.eigh(cov)
+    centered = chain - np.mean(chain, axis=0, keepdims=True)
+    scale = float(np.max(np.abs(centered)))
+    if scale == 0.0:
+        return centered, {"whitening_eig_floor": 0.0, "whitening_condition_number": None}
+
+    scaled = centered / scale
+    eigvecs, eigvals = sample_covariance_eigendecomposition(
+        scaled,
+        assume_centered=True,
+    )
     eig_max = float(np.max(eigvals)) if eigvals.size else 0.0
-    eig_floor = float(covariance_floor * max(eig_max, 1.0))
+    relative_floor = max(covariance_floor, np.finfo(float).eps * chain.shape[1])
+    eig_floor = float(relative_floor * eig_max)
     eigvals_safe = np.maximum(eigvals, eig_floor)
     inv_sqrt = eigvecs @ np.diag(1.0 / np.sqrt(eigvals_safe)) @ eigvecs.T
     condition_number = float(np.max(eigvals_safe) / np.min(eigvals_safe))
-    return centered @ inv_sqrt.T, {
+    return scaled @ inv_sqrt.T, {
         "whitening_eig_floor": eig_floor,
         "whitening_condition_number": condition_number,
     }
@@ -351,6 +409,9 @@ class HitAndRunSampler:
     feasibility_tol: float = 1e-10
     max_feasible_tries: int = 20000
     bounds: np.ndarray | None = None
+    direction_eigenvectors: np.ndarray | None = None
+    direction_eigenvalues: np.ndarray | None = None
+    direction_eigenvalue_floor: float = 1e-4  # At most 1e2 directional aspect ratio.
 
     def sample(
         self,
@@ -367,6 +428,7 @@ class HitAndRunSampler:
             raise ValueError("thinning must be at least 1.")
 
         rng = as_rng(random_state)
+        eigenvectors, sqrt_eigenvalues = self._direction_spectrum(region.dimension)
         if x0 is None:
             x = find_feasible_point(
                 region,
@@ -387,6 +449,8 @@ class HitAndRunSampler:
 
         for step in range(total_steps):
             direction = rng.normal(size=region.dimension)
+            if eigenvectors is not None:
+                direction = eigenvectors @ (sqrt_eigenvalues * direction)
             direction_norm = np.linalg.norm(direction)
             if direction_norm == 0.0:
                 continue
@@ -400,6 +464,49 @@ class HitAndRunSampler:
                 samples.append(x.copy())
 
         return np.asarray(samples, dtype=float)
+
+    def _direction_spectrum(
+        self,
+        dimension: int,
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        eigenvectors = self.direction_eigenvectors
+        eigenvalues = self.direction_eigenvalues
+        if eigenvectors is None and eigenvalues is None:
+            return None, None
+        if eigenvectors is None or eigenvalues is None:
+            raise ValueError(
+                "direction_eigenvectors and direction_eigenvalues must be provided together."
+            )
+
+        eigenvectors = np.asarray(eigenvectors, dtype=float)
+        eigenvalues = np.asarray(eigenvalues, dtype=float).reshape(-1)
+        if eigenvectors.shape != (dimension, dimension):
+            raise ValueError(
+                "direction_eigenvectors must have shape "
+                f"{(dimension, dimension)}, got {eigenvectors.shape}."
+            )
+        if eigenvalues.shape != (dimension,):
+            raise ValueError(
+                f"direction_eigenvalues must have shape ({dimension},), "
+                f"got {eigenvalues.shape}."
+            )
+        if not np.all(np.isfinite(eigenvectors)) or not np.all(np.isfinite(eigenvalues)):
+            raise ValueError("Direction eigenvectors and eigenvalues must be finite.")
+        if not np.allclose(
+            eigenvectors.T @ eigenvectors,
+            np.eye(dimension),
+            rtol=1e-8,
+            atol=1e-10,
+        ):
+            raise ValueError("direction_eigenvectors must be orthonormal.")
+
+        safe_eigenvalues, _ = floor_covariance_eigenvalues(
+            eigenvalues,
+            self.direction_eigenvalue_floor,
+        )
+        sqrt_eigenvalues = np.sqrt(safe_eigenvalues)
+        sqrt_eigenvalues /= np.max(sqrt_eigenvalues)
+        return eigenvectors, sqrt_eigenvalues
 
     def _step_interval(
         self,

@@ -17,6 +17,7 @@ GAUSSIAN_DEFAULT_INTERVAL = (-3.0, 3.0)
 PLANE_WAVE_DEFAULT_INTERVAL = (-3.0, 3.0)
 SPHERICAL_PIECEWISE_DEFAULT_INTERVAL = QUADRATIC_DEFAULT_INTERVAL
 ROSENBROCK_DEFAULT_INTERVAL = (-2.0, 3.0)
+RASTRIGIN_DEFAULT_INTERVAL = (-5.12, 5.12)
 
 
 def rotation_matrix_2d(angle: float, degrees: bool = False) -> np.ndarray:
@@ -323,6 +324,46 @@ def default_gaussian_mixture_2d(beta: float = 1.0) -> GaussianMixtureFunction:
     )
 
 
+def sphere_radius_for_box_volume_fraction(
+    bounds: np.ndarray,
+    volume_fraction: float,
+    center: np.ndarray | None = None,
+    n_probe: int = 100_000,
+    random_state: RandomState = None,
+) -> float:
+    """Estimate a sphere radius enclosing a fraction of a uniform box."""
+
+    bounds = np.asarray(bounds, dtype=float)
+    if bounds.ndim != 2 or bounds.shape[1] != 2:
+        raise ValueError(f"bounds must have shape (d, 2), got {bounds.shape}.")
+    if not np.all(np.isfinite(bounds)) or np.any(bounds[:, 0] >= bounds[:, 1]):
+        raise ValueError("bounds must be finite with lower values below upper values.")
+    volume_fraction = float(volume_fraction)
+    if not 0.0 < volume_fraction < 1.0:
+        raise ValueError("volume_fraction must satisfy 0 < fraction < 1.")
+    if n_probe < 2:
+        raise ValueError("n_probe must be at least 2.")
+
+    dimension = bounds.shape[0]
+    center = (
+        np.mean(bounds, axis=1)
+        if center is None
+        else _validate_vector(center, dimension, "center")
+    )
+    rng = _as_rng(random_state)
+    distances = np.empty(int(n_probe), dtype=float)
+    batch_size = max(1, min(int(n_probe), 1_000_000 // dimension))
+    for start in range(0, int(n_probe), batch_size):
+        stop = min(start + batch_size, int(n_probe))
+        points = rng.uniform(
+            bounds[:, 0],
+            bounds[:, 1],
+            size=(stop - start, dimension),
+        )
+        distances[start:stop] = np.linalg.norm(points - center, axis=1)
+    return float(np.quantile(distances, volume_fraction))
+
+
 @dataclass
 class RosenbrockFunction:
     """Sum b*(x[j+1] - x[j]^2)^2 + (a - x[j])^2 over adjacent pairs."""
@@ -343,6 +384,28 @@ class RosenbrockFunction:
         values = np.sum(
             self.b * (X[:, 1:] - X[:, :-1] ** 2) ** 2
             + (self.a - X[:, :-1]) ** 2,
+            axis=1,
+        )
+        return _restore_output(values, scalar_input)
+
+
+@dataclass
+class RastriginFunction:
+    """Standard multimodal Rastrigin function."""
+
+    dimension: int
+    A: float = 10.0
+
+    def __post_init__(self) -> None:
+        self.dimension = _validate_dimension(self.dimension, minimum=1)
+        self.A = _validate_finite_scalar(self.A, "A")
+        if self.A < 0.0:
+            raise ValueError("A must be nonnegative.")
+
+    def __call__(self, x: np.ndarray) -> float | np.ndarray:
+        X, scalar_input = _as_points(x, self.dimension)
+        values = self.A * self.dimension + np.sum(
+            X**2 - self.A * np.cos(2.0 * np.pi * X),
             axis=1,
         )
         return _restore_output(values, scalar_input)

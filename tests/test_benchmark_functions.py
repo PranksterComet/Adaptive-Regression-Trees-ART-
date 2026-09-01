@@ -1,22 +1,26 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from art.domain import BoxDomain
 from examples.benchmark_functions import (
     GAUSSIAN_DEFAULT_INTERVAL,
     PLANE_WAVE_DEFAULT_INTERVAL,
     QUADRATIC_DEFAULT_INTERVAL,
+    RASTRIGIN_DEFAULT_INTERVAL,
     ROSENBROCK_DEFAULT_INTERVAL,
     SPHERICAL_PIECEWISE_DEFAULT_INTERVAL,
     GaussianFunction,
     GaussianMixtureFunction,
     PlaneWaveFunction,
     QuadraticFunction,
+    RastriginFunction,
     RosenbrockFunction,
     SphericalPiecewisePolynomialFunction,
     default_gaussian_mixture_2d,
     rotation_matrix_2d,
+    sphere_radius_for_box_volume_fraction,
 )
 from examples.tree_2D_benchmark import add_output_offset
 
@@ -37,12 +41,14 @@ def test_paper_default_domains() -> None:
     rosenbrock = BoxDomain.hypercube(2, *ROSENBROCK_DEFAULT_INTERVAL)
     plane_wave = BoxDomain.hypercube(2, *PLANE_WAVE_DEFAULT_INTERVAL)
     spherical = BoxDomain.hypercube(2, *SPHERICAL_PIECEWISE_DEFAULT_INTERVAL)
+    rastrigin = BoxDomain.hypercube(2, *RASTRIGIN_DEFAULT_INTERVAL)
 
     assert np.array_equal(quadratic.bounds, [[-3.0, 3.0], [-3.0, 3.0]])
     assert np.array_equal(gaussian.bounds, [[-3.0, 3.0], [-3.0, 3.0]])
     assert np.array_equal(rosenbrock.bounds, [[-2.0, 3.0], [-2.0, 3.0]])
     assert np.array_equal(plane_wave.bounds, quadratic.bounds)
     assert np.array_equal(spherical.bounds, quadratic.bounds)
+    assert np.array_equal(rastrigin.bounds, [[-5.12, 5.12], [-5.12, 5.12]])
 
 
 def test_quadratic_paper_defaults_and_batch_evaluation() -> None:
@@ -121,6 +127,30 @@ def test_spherical_piecewise_polynomial_validates_pieces_and_radius() -> None:
         SphericalPiecewisePolynomialFunction(piece_2d, piece_3d, radius=1.0)
     with np.testing.assert_raises_regex(ValueError, "radius must be positive"):
         SphericalPiecewisePolynomialFunction(piece_2d, piece_2d, radius=0.0)
+
+
+def test_sphere_radius_matches_requested_box_volume_fraction() -> None:
+    bounds = np.array([[-2.0, 2.0], [-1.0, 3.0], [-3.0, 1.0]])
+    center = np.mean(bounds, axis=1)
+    radius = sphere_radius_for_box_volume_fraction(
+        bounds,
+        volume_fraction=0.3,
+        center=center,
+        n_probe=50_000,
+        random_state=7,
+    )
+    rng = np.random.default_rng(19)
+    points = rng.uniform(bounds[:, 0], bounds[:, 1], size=(50_000, 3))
+    measured = np.mean(np.linalg.norm(points - center, axis=1) <= radius)
+
+    assert measured == pytest.approx(0.3, abs=0.01)
+    assert radius == sphere_radius_for_box_volume_fraction(
+        bounds,
+        volume_fraction=0.3,
+        center=center,
+        n_probe=50_000,
+        random_state=7,
+    )
 
 
 def test_plane_wave_supports_general_dimension_and_normalizes_normal() -> None:
@@ -245,3 +275,20 @@ def test_rosenbrock_defaults_and_custom_coefficients() -> None:
 
     assert np.allclose(default(X), [0.0, 2.0])
     assert custom(np.array([1.0, 3.0])) == 21.0
+
+
+def test_rastrigin_standard_parameters_and_batch_evaluation() -> None:
+    function = RastriginFunction(dimension=3)
+    custom = RastriginFunction(dimension=2, A=2.0)
+    X = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [0.5, 0.5, 0.5],
+        ]
+    )
+
+    assert function.A == 10.0
+    assert np.allclose(function(X), [0.0, 3.0, 60.75])
+    assert function(X[0]) == 0.0
+    assert np.isclose(custom(np.array([0.5, 0.0])), 4.25)

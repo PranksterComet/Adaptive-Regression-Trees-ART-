@@ -20,8 +20,8 @@ ContourScale = Literal["linear", "log", "symlog", "auto"]
 class TreeLeafGrid:
     """A routed 2D plotting grid shared by tree-region visualizations."""
 
-    X1: np.ndarray
-    X2: np.ndarray
+    x1: np.ndarray
+    x2: np.ndarray
     leaves: tuple[LeafNode, ...]
     labels: np.ndarray
 
@@ -32,17 +32,27 @@ def make_2d_grid(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return coordinate meshes and flattened points covering a 2D box."""
 
+    x1, x2 = _make_2d_axes(bounds, resolution)
+    X1, X2 = np.meshgrid(x1, x2)
+    points = np.column_stack([X1.ravel(), X2.ravel()])
+    return X1, X2, points
+
+
+def _make_2d_axes(
+    bounds: np.ndarray,
+    resolution: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return one-dimensional coordinate axes for a regular 2D box grid."""
+
     bounds = np.asarray(bounds, dtype=float)
     if bounds.shape != (2, 2):
         raise ValueError(f"bounds must have shape (2, 2), got {bounds.shape}.")
     if resolution < 2:
         raise ValueError("resolution must be at least 2.")
-
-    x1 = np.linspace(bounds[0, 0], bounds[0, 1], resolution)
-    x2 = np.linspace(bounds[1, 0], bounds[1, 1], resolution)
-    X1, X2 = np.meshgrid(x1, x2)
-    points = np.column_stack([X1.ravel(), X2.ravel()])
-    return X1, X2, points
+    return (
+        np.linspace(bounds[0, 0], bounds[0, 1], resolution),
+        np.linspace(bounds[1, 0], bounds[1, 1], resolution),
+    )
 
 
 def make_tree_leaf_grid(
@@ -55,9 +65,10 @@ def make_tree_leaf_grid(
     leaves = tuple(tree.iter_leaves())
     if not leaves:
         raise ValueError("Cannot plot a tree without leaves.")
-    X1, X2, points = make_2d_grid(bounds, resolution)
-    labels = _leaf_labels(tree, points, leaves).reshape(X1.shape)
-    return TreeLeafGrid(X1=X1, X2=X2, leaves=leaves, labels=labels)
+    x1, x2 = _make_2d_axes(bounds, resolution)
+    points = np.column_stack([np.tile(x1, x2.size), np.repeat(x2, x1.size)])
+    labels = _leaf_labels(tree, points, leaves).reshape(x2.size, x1.size)
+    return TreeLeafGrid(x1=x1, x2=x2, leaves=leaves, labels=labels)
 
 
 def resolve_contour_scale(
@@ -196,6 +207,80 @@ def _contour_style(
     return values, contour_levels, norm, "coolwarm"
 
 
+def predict_tree_leaf_grid(leaf_grid: TreeLeafGrid) -> np.ndarray:
+    """Evaluate each leaf model once on its assigned plotting-grid points."""
+
+    predictions = np.empty(leaf_grid.labels.shape, dtype=float)
+    for label, leaf in enumerate(leaf_grid.leaves):
+        rows, columns = np.nonzero(leaf_grid.labels == label)
+        if rows.size == 0:
+            continue
+        points = np.column_stack([leaf_grid.x1[columns], leaf_grid.x2[rows]])
+        values = np.asarray(leaf.model.predict(points), dtype=float).reshape(-1)
+        if values.shape[0] != rows.size:
+            raise ValueError(
+                f"Leaf model returned {values.shape[0]} predictions for "
+                f"{rows.size} grid points."
+            )
+        predictions[rows, columns] = values
+    return predictions
+
+
+def save_tree_contour(
+    leaf_grid: TreeLeafGrid,
+    title: str,
+    out_path: Path,
+    levels: int = 30,
+    scale: ContourScale = "linear",
+    dynamic_range_threshold: float = 1e3,
+    symlog_linthresh: float | None = None,
+) -> Literal["linear", "log", "symlog"]:
+    """Evaluate a routed tree grid and save its predicted filled contours."""
+
+    values = predict_tree_leaf_grid(leaf_grid)
+    resolved_scale = resolve_contour_scale(
+        values,
+        scale=scale,
+        dynamic_range_threshold=dynamic_range_threshold,
+    )
+    plot_values, contour_levels, norm, cmap = _contour_style(
+        values,
+        scale=resolved_scale,
+        levels=levels,
+        symlog_linthresh=symlog_linthresh,
+    )
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    filled = ax.contourf(
+        leaf_grid.x1,
+        leaf_grid.x2,
+        plot_values,
+        levels=contour_levels,
+        norm=norm,
+        cmap=cmap,
+    )
+    ax.contour(
+        leaf_grid.x1,
+        leaf_grid.x2,
+        plot_values,
+        levels=contour_levels,
+        colors="black",
+        linewidths=0.25,
+        alpha=0.35,
+    )
+    colorbar = fig.colorbar(filled, ax=ax, label="tree prediction")
+    if resolved_scale == "log":
+        log_ticks = np.geomspace(norm.vmin, norm.vmax, min(7, levels + 1))
+        colorbar.set_ticks(log_ticks, labels=[f"{tick:.1e}" for tick in log_ticks])
+    ax.set(xlabel="x1", ylabel="x2", title=title)
+    ax.set_aspect("equal", adjustable="box")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    print(f"saved plot: {out_path}")
+    return resolved_scale
+
+
 def save_tree_leaf_regions(
     tree: RegressionTree,
     bounds: np.ndarray,
@@ -220,8 +305,8 @@ def save_tree_leaf_regions(
 
     fig, ax = plt.subplots(figsize=(7, 6))
     ax.pcolormesh(
-        leaf_grid.X1,
-        leaf_grid.X2,
+        leaf_grid.x1,
+        leaf_grid.x2,
         color_grid,
         shading="nearest",
         cmap=plt.get_cmap("tab20", n_colors),
@@ -267,8 +352,8 @@ def save_tree_leaf_error_regions(
     error_grid = plot_errors[leaf_grid.labels]
     fig, ax = plt.subplots(figsize=(7, 6))
     shading = ax.pcolormesh(
-        leaf_grid.X1,
-        leaf_grid.X2,
+        leaf_grid.x1,
+        leaf_grid.x2,
         error_grid,
         shading="nearest",
         cmap="Greys",
@@ -325,16 +410,17 @@ def _draw_leaf_boundaries(
         mask = leaf_grid.labels == label
         if np.any(mask) and not np.all(mask):
             ax.contour(
-                leaf_grid.X1,
-                leaf_grid.X2,
+                leaf_grid.x1,
+                leaf_grid.x2,
                 mask.astype(float),
                 levels=[0.5],
                 colors="black",
                 linewidths=0.8,
             )
         if label_leaves and np.any(mask):
+            rows, columns = np.nonzero(mask)
             position = np.clip(
-                [np.mean(leaf_grid.X1[mask]), np.mean(leaf_grid.X2[mask])],
+                [np.mean(leaf_grid.x1[columns]), np.mean(leaf_grid.x2[rows])],
                 bounds[:, 0] + label_margin,
                 bounds[:, 1] - label_margin,
             )
@@ -531,7 +617,12 @@ def save_histogram(
         if log_bins:
             positive = values[values > 0.0]
             if positive.size:
-                bins_arg = np.logspace(np.log10(np.min(positive)), np.log10(np.max(positive)), bins + 1)
+                lower = float(np.min(positive))
+                upper = float(np.max(positive))
+                if lower == upper:
+                    lower /= 10.0
+                    upper *= 10.0
+                bins_arg = np.logspace(np.log10(lower), np.log10(upper), bins + 1)
                 values = positive
                 plt.xscale("log")
             else:
