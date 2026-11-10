@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from math import comb
-from typing import Literal, Protocol, runtime_checkable
+from typing import Callable, Literal, Protocol, runtime_checkable
 
 import numpy as np
 
@@ -34,6 +34,24 @@ class RidgeSolveResult:
     ridge_effective: float
     rank: int | None = None
     fallback_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class WeightedNormalEquations:
+    """Unregularized CPU matrices, optionally derived by complementary subtraction.
+
+    A derived system can be rebuilt directly if subtraction error, amplified by
+    its condition number, is material. The callback is used only during a fit;
+    fitted models retain coefficients and diagnostics, not device workspaces.
+    """
+
+    gram: np.ndarray
+    rhs: np.ndarray
+    subtraction_bound: float = 0.0
+    rebuild: Callable[[], "WeightedNormalEquations"] | None = field(
+        default=None, repr=False, compare=False
+    )
+    subtraction_rhs_bound: float = 0.0
 
 
 @runtime_checkable
@@ -205,6 +223,8 @@ def solve_weighted_ridge(
     weight_floor: float = 1e-12,
     solver: RidgeSolver = "normal",
     auto_rcond_threshold: float = DEFAULT_AUTO_RCOND_THRESHOLD,
+    *,
+    normal_equations: WeightedNormalEquations | None = None,
 ) -> RidgeSolveResult:
     design = np.asarray(design, dtype=float)
     y = np.asarray(y, dtype=float).reshape(-1)
@@ -220,12 +240,34 @@ def solve_weighted_ridge(
     _validate_ridge_solver(solver)
     _validate_auto_rcond_threshold(auto_rcond_threshold)
 
-    safe_weights = np.maximum(weights, float(weight_floor))
+    # CUDA already floored its fitting weights. Recreate them on the CPU only
+    # if an augmented QR/SVD fallback actually needs the weighted design.
+    safe_weights = (
+        np.maximum(weights, float(weight_floor))
+        if normal_equations is None else None
+    )
     from scipy import linalg
 
     if solver in ("auto", "normal"):
-        gram = design.T @ (design * safe_weights[:, None])
-        rhs = design.T @ (y * safe_weights)
+        if normal_equations is None:
+            gram = design.T @ (design * safe_weights[:, None])
+            rhs = design.T @ (y * safe_weights)
+        else:
+            gram = np.asarray(normal_equations.gram, dtype=float)
+            rhs = np.asarray(normal_equations.rhs, dtype=float)
+            p = design.shape[1]
+            if gram.shape != (p, p) or rhs.shape != (p,):
+                raise ValueError("Precomputed Gram/rhs shapes do not match the design.")
+            if not np.all(np.isfinite(gram)) or not np.all(np.isfinite(rhs)):
+                raise ValueError("Precomputed Gram/rhs must be finite.")
+
+            def rebuild_system() -> RidgeSolveResult:
+                return solve_weighted_ridge(
+                    design, y, weights, ridge, weight_floor, solver,
+                    auto_rcond_threshold,
+                    normal_equations=normal_equations.rebuild(),
+                )
+
         ridge_eff = scaled_ridge_from_gram(gram, ridge)
         regularized_gram = gram.copy()
         regularized_gram.flat[:: gram.shape[0] + 1] += ridge_eff
@@ -238,12 +280,16 @@ def solve_weighted_ridge(
                 check_finite=False,
             )
         except linalg.LinAlgError as exc:
+            if normal_equations is not None and normal_equations.rebuild is not None:
+                return rebuild_system()
             if solver == "normal":
                 raise np.linalg.LinAlgError(
                     "Normal-equation Cholesky factorization failed; use "
                     "solver='auto', solver='qr', or solver='svd', or increase "
                     "ridge regularization."
                 ) from exc
+            if safe_weights is None:
+                safe_weights = np.maximum(weights, float(weight_floor))
             return _solve_augmented_ridge(
                 design,
                 y,
@@ -267,6 +313,24 @@ def solve_weighted_ridge(
             cond_estimate = np.inf
             condition_estimator = "condition_estimate_failure"
 
+        if normal_equations is not None and normal_equations.rebuild is not None:
+            # A well-scaled derived Gram may still lose information in its
+            # smallest eigendirections. Rebuild before accepting that system or
+            # deciding to fall back to QR. This is separate from the user's
+            # normal/auto solver policy.
+            relative_bound = normal_equations.subtraction_bound / max(
+                float(gram_norm), np.finfo(float).tiny
+            )
+            relative_rhs_bound = normal_equations.subtraction_rhs_bound / max(
+                float(linalg.norm(rhs, 1, check_finite=False)),
+                np.finfo(float).tiny,
+            )
+            if (
+                gram_rcond < auto_rcond_threshold
+                or max(relative_bound, relative_rhs_bound) > 1e-8 * gram_rcond
+            ):
+                return rebuild_system()
+
         if solver == "normal" or gram_rcond >= auto_rcond_threshold:
             coefficients = linalg.cho_solve(factor, rhs, check_finite=False)
             return RidgeSolveResult(
@@ -278,6 +342,8 @@ def solve_weighted_ridge(
                 ridge_effective=ridge_eff,
             )
 
+        if safe_weights is None:
+            safe_weights = np.maximum(weights, float(weight_floor))
         return _solve_augmented_ridge(
             design,
             y,
@@ -290,6 +356,8 @@ def solve_weighted_ridge(
             fallback_reason="rcond_below_threshold",
         )
 
+    if normal_equations is not None:
+        raise ValueError("Precomputed normal equations require solver='normal' or 'auto'.")
     sqrt_weights = np.sqrt(safe_weights)
     weighted_design = design * sqrt_weights[:, None]
     ridge_eff = float(ridge) * float(np.sum(weighted_design**2)) / design.shape[1]
@@ -448,6 +516,8 @@ class AffineRidgeModel:
         y: np.ndarray,
         weights: np.ndarray,
         weight_floor: float = 1e-12,
+        *,
+        normal_equations: WeightedNormalEquations | None = None,
     ) -> "AffineRidgeModel":
         self.solve_result_ = solve_weighted_ridge(
             augment_features(X),
@@ -457,6 +527,7 @@ class AffineRidgeModel:
             weight_floor=weight_floor,
             solver=self.solver,
             auto_rcond_threshold=self.auto_rcond_threshold,
+            normal_equations=normal_equations,
         )
         self.coef_ = self.solve_result_.coefficients
         return self
@@ -562,6 +633,8 @@ class PolynomialRidgeModel:
         y: np.ndarray,
         weights: np.ndarray,
         weight_floor: float = 1e-12,
+        *,
+        normal_equations: WeightedNormalEquations | None = None,
     ) -> "PolynomialRidgeModel":
         self._validate_prepared(prepared)
         self.solve_result_ = solve_weighted_ridge(
@@ -572,6 +645,7 @@ class PolynomialRidgeModel:
             weight_floor=weight_floor,
             solver=self.solver,
             auto_rcond_threshold=self.auto_rcond_threshold,
+            normal_equations=normal_equations,
         )
         self.transformer_ = prepared.feature_state
         self.coef_ = self.solve_result_.coefficients

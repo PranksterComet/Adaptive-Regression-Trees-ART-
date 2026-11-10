@@ -31,7 +31,7 @@ def main() -> None:
     parser.add_argument("--dim", type=int, default=2)
     parser.add_argument("--low", type=float, default=-1.0)
     parser.add_argument("--high", type=float, default=1.0)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--c-values", type=str, default="0.5,1.0,2.0,4.0")
     parser.add_argument("--max-points", type=int, default=512)
     parser.add_argument("--use-all-points", action="store_true")

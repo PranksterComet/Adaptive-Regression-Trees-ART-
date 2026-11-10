@@ -1,6 +1,6 @@
 # Adaptive Regression Trees (ART): Project Context
 
-Last implementation review: 2026-09-01
+Last configuration review: 2026-11-10
 
 This document is a technical handoff for agents and collaborators working on
 ART. It describes the intended research problem, the mathematical ideas behind
@@ -11,6 +11,53 @@ The repository is an active research prototype. Treat statements labeled
 **implemented** as descriptions of the current code, **experimental** as code
 that exists but is not fully integrated or validated, and **planned** as design
 intent rather than current behavior.
+
+## CPU Smoke Tests
+
+After creating the environment, run these commands from the repository root to
+check the complete CPU pipeline: benchmark construction, parallel Numba
+sampling, soft-oblique optimization, tree persistence, testing, and reporting.
+The high-dimensional script is named `tree_high_dim_benchmark.py` (singular).
+
+```bash
+python examples/tree_high_dim_benchmark.py \
+  --benchmark rosenbrock \
+  --dimension 5 \
+  --leaf-degree 2 \
+  --sampler parallel_numba \
+  --optimizer cpu \
+  --traversal dfs \
+  --max-iters 50 \
+  --sample-multiplier 10 \
+  --offset 1 \
+  --max-depth 10 \
+  --output-dir examples/_smoke_high_dim_rosenbrock
+```
+
+A successful run prints the test relative L2 error, leaf count, oracle-query
+count, and build time. It writes `report.txt`, `node_diagnostics.csv`,
+`tree.joblib`, and `test_error_histogram.png` under the output directory.
+
+Run the corresponding 2D benchmark to exercise the visualization pipeline:
+
+```bash
+python examples/tree_2D_benchmark.py \
+  --benchmark rosenbrock \
+  --leaf-degree 2 \
+  --sampler parallel_numba \
+  --optimizer cpu \
+  --traversal dfs \
+  --max-iters 50 \
+  --sample-multiplier 10 \
+  --offset 1 \
+  --max-depth 10 \
+  --output-dir examples/_smoke_2D_rosenbrock
+```
+
+In addition to the report, diagnostics, and saved tree, the 2D run produces
+`benchmark_contour.png`, `tree_prediction_contour.png`,
+`tree_leaf_regions.png`, and `tree_leaf_errors.png`. The `_smoke_*` output
+directories are ignored by Git.
 
 ## 1. Vision
 
@@ -63,7 +110,7 @@ polytope and solves a smoothed, nonconvex empirical optimization problem.
 
 The recursive objective is not currently posed as one globally optimized tree
 problem. Construction is greedy: each node accepts the locally best split found
-by its splitter, subject to balance and empirical MSE-gain checks.
+by its splitter, subject to side-size/numerical checks and optional MSE-gain checks.
 
 ## 3. Design Principles
 
@@ -83,6 +130,21 @@ The current architecture follows these principles:
    inspectable rather than disappearing behind a generic leaf status.
 6. **Count oracle queries explicitly.** Geometry-only pilot chains and model
    refits do not increment the oracle-query count.
+7. **Match module names to their responsibility.** Shared CUDA kernel loading
+   belongs in `_cuda_optimizer_kernels.py`; hybrid Gram construction and batched
+   optimization have their own modules. Keep new solver/control code in the
+   appropriate module rather than expanding an unrelated solver file.
+8. **Reuse capacity workspaces across GPU cohorts.** Allocate features, batched
+   Cholesky and optimizer storage once per build, then load packed CPU X/y for
+   each occupied prefix. The BFS scheduler reuses existing
+   builder policy helpers. Keep retry scheduling simple: the expected setting
+   is one additional builder retry, reusing resident samples/features. This
+   does not change current defaults; BFS with cupy_batched_cholesky uses resident
+   batched GPU dispatch, while other configurations retain scalar splitting.
+9. **Initialize batched splits on GPU.** The BFS GPU dispatcher omits
+   theta0: the workspace generates Gaussian unit directions and median(Xw)
+   offsets on GPU, seeded once from CPU configuration. Explicit initial states
+   remain available for controlled comparisons. Reuse initial Xw in gate setup.
 
 ## 4. Module Map
 
@@ -94,10 +156,18 @@ The current architecture follows these principles:
 | `metrics.py` | MSE, relative L2, pointwise relative errors and quantiles | Implemented |
 | `objectives.py` | Cached soft oblique objective and gradient | Implemented with mathematical caveats |
 | `optimizers.py` | Armijo backtracking and adaptive initial step controller | Implemented |
+| `_cuda_hybrid_gram.py` | GPU weighted Grams/RHS for CPU solving | Implemented |
+| `_cuda_optimizer.py` | Single-node resident GPU QR/Cholesky optimization | Implemented |
+| `_cuda_batched_matmul.py` | Pointer-based GPU products over active node slots | Implemented |
+| `_cuda_features.py` / `.cu` | Resident affine/quadratic feature construction for batched optimization | Implemented |
+| `_cuda_batched_cholesky.py` | Full/subset batched weighted Cholesky fits | Implemented |
+| `_cuda_batched_optimizer.py` | Reusable capacity workspace and projected GD with independent node state | Implemented; integrated with BFS |
 | `splitters.py` | Soft oblique and hinge-affine splitters, split diagnostics | Implemented |
 | `temperature.py` | Geometric temperature scales and candidate grids | Implemented |
 | `presets.py` | Shared benchmark defaults and effective-dimension side-size policy | Implemented |
-| `builder.py` | Sampling, fitting, stopping, splitting, retries, recursion, query accounting | Implemented basic builder |
+| `builder.py` | Shared node preparation/finalization, DFS/BFS dispatch, sampling and split policies | Implemented |
+| `_batched_builder.py` | FIFO ready-cohort scheduling and child attachment using shared builder policies | Implemented |
+| `_cuda_batched_builder.py` | Persistent GPU cohort dispatch, packing and selected-slot retries | Implemented |
 | `tree.py` | Node structures, batched prediction, traversal, joblib persistence | Implemented |
 | `timing.py` | Optional aggregate build-time profiling | Implemented; intentionally coarse |
 
@@ -107,6 +177,41 @@ unit tests plus statistical diagnostic scripts; not every diagnostic script is
 a deterministic unit test.
 
 ## 5. Current Tree-Building Algorithm
+
+The default `traversal="dfs"` and optional `traversal="bfs"` share node
+preparation, stopping, retry policy and finalization in builder.py.
+The FIFO implementation in `_batched_builder.py` collects up to
+`node_batch_size` ready candidates (default 20), appends inherited-only child
+jobs, and fills provisional leaf slots when those jobs finish. BFS with
+SoftObliqueSplitter(optimizer="cupy_batched_cholesky") uses the GPU dispatcher
+in `_cuda_batched_builder.py`; CPU, hybrid Gram, QR and single-node Cholesky use scalar
+splitting. One workspace is allocated per build with capacity node_batch_size.
+The dispatcher packs directly into its CPU X/y buffers, loads the occupied
+prefix, constructs Phi on GPU and optimizes with CPU parent losses and GPU
+initial states. Retries select resident slots without another data upload.
+batch_reorder=True (default) compacts active pointers each GD iteration;
+False keeps all requested nodes in least-squares calls. Node/leaf-model fits,
+sampling, oracle queries and stopping decisions remain on CPU. Temperature
+tuning candidates still use the existing scalar path; chosen-temperature
+optimization is batched. Queue cohorts may cross levels. Stochastic DFS/BFS runs
+can differ because their random draws occur in different orders. The GPU RNG
+is seeded once from the builder RNG and advances across cohorts/retries.
+
+Final hard refits are skipped for soft splitters when check_split_gain=False,
+n_restarts=1, and temperature strategy is fixed or splitter (no candidate tuning).
+The splitter then returns geometry/counts with None for child models and hard
+loss/gains. The builder queues children with the fitted parent model as a
+temporary placeholder, tops up their inherited samples and fits them on CPU.
+This applies to CPU/hybrid, single-node GPU and batched GPU soft splitters.
+Side-size checks, min-side fallback and soft-fit numerical checks remain active;
+there is no additional min-side-count >= p requirement. Gain checks, multiple
+restarts or temperature tuning retain hard refits. Such builders print the
+single init message "Final hard refits enabled.". Standalone split/optimize
+calls keep hard_refit=True by default; explicit False requires n_restarts=1.
+SplitResult.has_hard_fit reports availability; predict() rejects proposals
+without hard models. Tree metadata records hard_refits, each split records
+hard_refit, and benchmark reports show resolved_hard_refits. Hard losses/gains
+are unavailable (None/blank), rather than estimates from soft models.
 
 For a region `R`, node sample target `n_node`, model template `M`, and stopping
 metric `e`, the builder performs:
@@ -162,9 +267,10 @@ counts grow combinatorially, making high-dimensional/high-degree fits expensive.
 The shared 2D/high-dimensional benchmark preset currently uses affine leaves,
 maximum depth 10, one splitter restart, three conditional failure retries,
 unregularized fits (`ridge=0`) with the `auto` solver, fixed local temperature
-scaling with `c=1`, thinning 20, covariance-shaped sampling, stored diagnostics,
-and no stored node samples. When `min_side_points` is not given, the benchmark
-harness resolves it to `p_eff`. These are experiment-harness defaults, not
+scaling with `c=1`, thinning 20, isotropic sampling disabled, stored diagnostics,
+and no stored node samples. The side-size defaults are min_side_points=1 and
+min_side_fraction=0.05; the required count is max(points, ceil(fraction*n)). There
+is no model-dimension-based resolution. These are experiment-harness defaults, not
 universal guarantees of the lower-level builder API.
 
 ### 5.2 Root and child sampling
@@ -196,16 +302,18 @@ separate absolute-or-relative stopping rule with an uncapped/raw diagnostic
 relative error has been discussed but is **not implemented**. This distinction
 matters for functions that approach or cross zero.
 
-Split acceptance is separate and always based on hard-split training MSE:
+Split gain is recorded from hard-split training MSE:
 
 ```text
 gain_abs = MSE_parent - MSE_split
 gain_rel = gain_abs / max(MSE_parent, 1e-12).
 ```
 
-The builder requires both values to exceed their configured thresholds. With
-the default absolute threshold zero, a split must still have strictly positive
-training MSE gain.
+check_split_gain=False is the default in both the builder and presets. When
+enabled, both values must exceed their configured thresholds; threshold zero
+still requires strictly positive gain. Disabling the checks also disables
+gain-triggered retries. Side-size, finite-result and numerical-failure checks
+remain in force, and gain metadata is still recorded.
 
 The distinction is intentional: a stopping metric describes approximation
 quality, while MSE gain provides an additive expectation-based split criterion.
@@ -252,6 +360,39 @@ solver, effective ridge, rank when available, a condition estimate and its
 estimator, and any fallback reason. Raw feature scaling remains unresolved.
 
 ### 6.3 Actual model support
+
+The soft splitter additionally supports an opt-in `optimizer="hybrid_gram"` for
+the built-in affine/polynomial models with `auto` or `normal` solvers. This
+accelerates paired weighted Gram/right-hand-side construction in float64;
+solving, condition checks, QR/SVD fallbacks, and optimizer operations remain on
+the CPU. A lazy dataset workspace uploads features/targets once and reuses
+allocations across soft refits and restarts; the builder shares it across
+same-node retries. Complementary construction includes weight-floor corrections
+and can be rebuilt directly when subtraction is unreliable. CPU remains the
+default and does not require CuPy. `tests/splitter_performance.py` automatically
+adds separate CUDA tables on a working GPU, includes upload/precomputation in
+timed fits, and applies `--cpu-threads` (default 16) consistently across backends.
+Reports record the requested limit, effective BLAS pools, and inherited settings.
+
+The resident optimizer modes `optimizer="cupy_qr"` and `"cupy_cholesky"`
+share GPU gates, predictions, gradients, cached routing scores, batched frozen-model
+Armijo search, and CPU stopping/step control. Cholesky caches the unregularized
+total Gram and derives the larger-trace side with weight-floor corrections;
+RHS vectors are computed directly. It preserves trace-scaled ridge and uses
+device-side status/finite checks with no condition estimate or numerical fallback.
+It reports `cholesky_failure` on numerical failure and exports CPU-only fitted
+models. The benchmark adds `--backend cuda_cholesky` and separate report/CSV
+outputs; `auto`/`all` can compare all four backends.
+
+The single optimizer selector accepts cpu, hybrid_gram, cupy_qr, cupy_cholesky
+and cupy_batched_cholesky. The first four work under DFS and BFS; the batched
+option requires BFS and is rejected with DFS. No gram_backend field remains.
+Temperature tuning for the batched option uses scalar cupy_cholesky candidates.
+Tree presets expose traversal="dfs", node_batch_size=20, batch_reorder=True;
+soft presets expose optimizer="cpu", backtrack_batch_size=8, Xw_refresh=32 and
+qr_parallel=True (single-node fit streams only). BFS_GPU_TREE_PRESET changes
+only traversal and optimizer to bfs and cupy_batched_cholesky. Shared benchmark
+arguments forward these choices, including --check-split-gain to enable gains.
 
 - `AffineRidgeModel`: fully usable in the builder, soft splitter, and HRT.
 - `PolynomialRidgeModel`: fully usable in the builder and soft splitter; feature
@@ -647,13 +788,14 @@ hard split is valid and improves MSE.
 
 Warnings are orthogonal to node status. Accepted/rejected `SplitResult` warnings
 include `small_init_grad` for a zero-iteration gradient-tolerance stop,
-alpha-bound saturation, `max_iters`, and high model conditioning. Sampling keeps
-its own warning tuple, including covariance-eigenvalue-floor saturation. A split
-may be accepted with warnings, while a rejected leaf may retain both its
-rejection status and diagnostic warnings. For a leaf created directly from
-`SplitNotFoundError`, only small-initial-gradient and high-conditioning flags are
-currently promoted to the top-level warning tuple; fuller alpha and optimizer
-state may still be present in `splitter_metadata`.
+alpha-bound saturation, `max_iters`, high model conditioning, and
+`min_side_fallback` when a split uses an earlier feasible optimizer state.
+Sampling keeps its own warning tuple, including covariance-eigenvalue-floor
+saturation. A split may be accepted with warnings, while a rejected leaf may
+retain both its rejection status and diagnostic warnings. For a leaf created
+directly from `SplitNotFoundError`, only small-initial-gradient and
+high-conditioning flags are currently promoted to the top-level warning tuple;
+fuller alpha and optimizer state may still be present in `splitter_metadata`.
 
 ### 11.2 Builder rejections
 
@@ -667,7 +809,9 @@ The builder separately rejects:
 initialization on `min_side_points` or insufficient gain. It reuses the same
 `X,y`; no oracle calls are added. To control cost, retries are permitted only
 when `splitter.n_restarts == 1` and are disabled while a node is actively tuning
-temperature.
+temperature. With `min_side_fallback` enabled, earlier attempts retain the
+existing failure behavior and the final attempt may return its last feasible
+optimizer state. This fallback remains subject to the normal split-gain checks.
 
 ### 11.3 Stored data
 
@@ -1172,8 +1316,8 @@ results, and documented hardware/timing methodology.
 
 1. Correct and finite-difference-test the regularized profiled objective.
 2. Add true-loss validation after frozen-model candidate acceptance.
-3. Add a balance-aware offset constraint or best-valid-iterate fallback and use
-   the known spherical-interface failures as regression cases.
+3. Compare the implemented last-feasible-iterate fallback with a
+   balance-aware offset constraint on the known spherical-interface failures.
 4. Calibrate the implemented `auto` solver's reciprocal-condition threshold and
    high-conditioning warning against explicit QR/SVD runs.
 5. Separate stopping from raw fit diagnostics, then add a held-out node

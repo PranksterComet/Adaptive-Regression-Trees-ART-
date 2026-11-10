@@ -3,11 +3,19 @@ channels:
   - conda-forge
 dependencies:
   - python=3.11
+  - c-compiler
+  - fortran-compiler
   - numpy
+  - numba
   - scipy
   - scikit-learn
+  - threadpoolctl
   - joblib
   - matplotlib
   - jupyter
   - ipykernel
   - pytest
+  - pip
+  - pip:
+      - clawpack==5.14.0
+      - tasmanian==8.2

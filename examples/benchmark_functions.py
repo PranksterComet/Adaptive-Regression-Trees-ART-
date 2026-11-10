@@ -13,11 +13,26 @@ PlaneWaveMode = Literal["explicit", "random"]
 RandomState = int | np.random.Generator | None
 
 QUADRATIC_DEFAULT_INTERVAL = (-3.0, 3.0)
-GAUSSIAN_DEFAULT_INTERVAL = (-3.0, 3.0)
+GAUSSIAN_DEFAULT_INTERVAL = (-1.0, 1.0)
+GAUSSIAN_MIXTURE_DEFAULT_INTERVAL = (-3.0, 3.0)
+GAUSSIAN_DEFAULT_CONDITION_NUMBER = 16.0
 PLANE_WAVE_DEFAULT_INTERVAL = (-3.0, 3.0)
 SPHERICAL_PIECEWISE_DEFAULT_INTERVAL = QUADRATIC_DEFAULT_INTERVAL
 ROSENBROCK_DEFAULT_INTERVAL = (-2.0, 3.0)
 RASTRIGIN_DEFAULT_INTERVAL = (-5.12, 5.12)
+
+FIXED_SPHERICAL_AFFINE_INSIDE_W = (-0.25, 0.35, -0.15, 0.20, -0.10)
+FIXED_SPHERICAL_AFFINE_OUTSIDE_W = (0.40, -0.30, 0.20, -0.10, 0.05)
+FIXED_SPHERICAL_AFFINE_INSIDE_BETA = 5.0
+FIXED_SPHERICAL_AFFINE_OUTSIDE_BETA = 0.0
+FIXED_SPHERICAL_AFFINE_OFFSET = 4.15
+FIXED_SPHERICAL_AFFINE_VOLUME_FRACTION = 0.5
+FIXED_SPHERICAL_AFFINE_RADII = {
+    2: 2.394139996923,
+    3: 2.954149913692,
+    4: 3.418315145003,
+    5: 3.834703297290,
+}
 
 
 def rotation_matrix_2d(angle: float, degrees: bool = False) -> np.ndarray:
@@ -136,6 +151,46 @@ class SphericalPiecewisePolynomialFunction:
         return _restore_output(values, scalar_input)
 
 
+def fixed_spherical_affine_pieces(
+    dimension: int,
+) -> tuple[QuadraticFunction, QuadraticFunction]:
+    """Return the fixed inside and outside affine pieces for dimensions 2--5."""
+
+    dimension = _validate_dimension(dimension, minimum=2)
+    max_dimension = len(FIXED_SPHERICAL_AFFINE_INSIDE_W)
+    if dimension > max_dimension:
+        raise ValueError(
+            f"fixed spherical affine pieces support dimension <= {max_dimension}."
+        )
+
+    zero_quadratic = np.zeros(dimension, dtype=float)
+    inside = QuadraticFunction(
+        dimension=dimension,
+        beta=FIXED_SPHERICAL_AFFINE_INSIDE_BETA,
+        w=np.asarray(FIXED_SPHERICAL_AFFINE_INSIDE_W[:dimension]),
+        Lambda=zero_quadratic,
+    )
+    outside = QuadraticFunction(
+        dimension=dimension,
+        beta=FIXED_SPHERICAL_AFFINE_OUTSIDE_BETA,
+        w=np.asarray(FIXED_SPHERICAL_AFFINE_OUTSIDE_W[:dimension]),
+        Lambda=zero_quadratic,
+    )
+    return inside, outside
+
+
+def fixed_spherical_affine_radius(dimension: int) -> float:
+    """Return the recorded 50%-volume sphere radius for dimensions 2--5."""
+
+    dimension = _validate_dimension(dimension, minimum=2)
+    try:
+        return FIXED_SPHERICAL_AFFINE_RADII[dimension]
+    except KeyError as error:
+        raise ValueError(
+            "fixed spherical affine radii support dimensions 2--5."
+        ) from error
+
+
 @dataclass
 class PlaneWaveFunction:
     """Plane wave beta + amplitude*cos(frequency*normal^T*x + phase)."""
@@ -193,10 +248,14 @@ class PlaneWaveFunction:
 
 @dataclass
 class GaussianFunction:
-    """Anisotropic Gaussian centered at mean with a cached precision matrix."""
+    """Scaled anisotropic Gaussian with a cached precision matrix."""
 
     dimension: int
     beta: float = 1.0
+    amplitude: float = 1.0
+    sharpness: float = 1.0
+    domain_scale: float = 1.0
+    condition_number: float = GAUSSIAN_DEFAULT_CONDITION_NUMBER
     Q: np.ndarray | None = None
     Sigma: np.ndarray | None = None
     q_mode: RotationMode = "identity"
@@ -204,10 +263,27 @@ class GaussianFunction:
     mean: np.ndarray | None = None
     covariance: np.ndarray = field(init=False, repr=False)
     precision: np.ndarray = field(init=False, repr=False)
+    precision_spectrum: np.ndarray = field(init=False)
 
     def __post_init__(self) -> None:
         self.dimension = _validate_dimension(self.dimension, minimum=1)
-        self.beta = float(self.beta)
+        self.beta = _validate_finite_scalar(self.beta, "beta")
+        self.amplitude = _validate_finite_scalar(self.amplitude, "amplitude")
+        self.sharpness = _validate_finite_scalar(self.sharpness, "sharpness")
+        self.domain_scale = _validate_finite_scalar(
+            self.domain_scale,
+            "domain_scale",
+        )
+        self.condition_number = _validate_finite_scalar(
+            self.condition_number,
+            "condition_number",
+        )
+        if self.sharpness <= 0.0:
+            raise ValueError("sharpness must be positive.")
+        if self.domain_scale <= 0.0:
+            raise ValueError("domain_scale must be positive.")
+        if self.condition_number < 1.0:
+            raise ValueError("condition_number must be at least 1.")
         self.mean = (
             np.zeros(self.dimension, dtype=float)
             if self.mean is None
@@ -219,29 +295,193 @@ class GaussianFunction:
             self.q_mode,
             self.random_state,
         )
-        self.Sigma = _resolve_symmetric_matrix(
-            self.Sigma,
-            self.dimension,
-            "Sigma",
-            default_diagonal=_paper_diagonal(self.dimension),
+        if self.Sigma is None:
+            self.precision_spectrum = _geometric_precision_spectrum(
+                self.dimension,
+                self.condition_number,
+            )
+            self.Sigma = np.diag(1.0 / self.precision_spectrum)
+            self.precision = (
+                self.Q @ np.diag(self.precision_spectrum) @ self.Q.T
+            )
+            self.covariance = self.Q @ self.Sigma @ self.Q.T
+        else:
+            self.Sigma = _resolve_symmetric_matrix(
+                self.Sigma,
+                self.dimension,
+                "Sigma",
+                default_diagonal=np.ones(self.dimension),
+            )
+            if np.min(np.linalg.eigvalsh(self.Sigma)) <= 0.0:
+                raise ValueError("Sigma must be positive definite.")
+            self.covariance = self.Q @ self.Sigma @ self.Q.T
+            # Explicit covariance input retains its original interpretation.
+            self.precision = np.linalg.inv(self.covariance)
+            self.precision_spectrum = np.linalg.eigvalsh(self.precision)[::-1]
+        self.condition_number = float(
+            self.precision_spectrum[0] / self.precision_spectrum[-1]
         )
-        if np.min(np.linalg.eigvalsh(self.Sigma)) <= 0.0:
-            raise ValueError("Sigma must be positive definite.")
-        self.covariance = self.Q @ self.Sigma @ self.Q.T
-        # Cache the inverse once; oracle evaluations only use matrix products.
-        self.precision = np.linalg.inv(self.covariance)
 
     def __call__(self, x: np.ndarray) -> float | np.ndarray:
         X, scalar_input = _as_points(x, self.dimension)
-        centered = X - self.mean
-        exponent = -0.5 * np.einsum(
+        centered = (X - self.mean) / self.domain_scale
+        exponent = -0.5 * self.sharpness * np.einsum(
             "ni,ij,nj->n",
             centered,
             self.precision,
             centered,
         )
-        values = self.beta + np.exp(exponent)
+        values = self.beta + self.amplitude * np.exp(exponent)
         return _restore_output(values, scalar_input)
+
+
+@dataclass
+class ActiveSubspaceGaussianFunction:
+    """Gaussian with strong variation in a seeded low-dimensional subspace."""
+
+    dimension: int
+    active_dimension: int = 3
+    eta: float = 0.1
+    a: float = 1.0
+    tau: np.ndarray | None = None
+    active_mean: np.ndarray | None = None
+    U: np.ndarray | None = None
+    random_state: RandomState = None
+
+    def __post_init__(self) -> None:
+        self.dimension = _validate_dimension(self.dimension, minimum=1)
+        self.active_dimension = _validate_dimension(
+            self.active_dimension,
+            minimum=1,
+        )
+        if self.active_dimension > self.dimension:
+            raise ValueError("active_dimension cannot exceed dimension.")
+
+        self.a = _validate_finite_scalar(self.a, "a")
+        self.eta = _validate_finite_scalar(self.eta, "eta")
+        if self.a <= 0.0:
+            raise ValueError("a must be positive.")
+        if self.eta < 0.0 or (
+            self.active_dimension < self.dimension and self.eta == 0.0
+        ):
+            raise ValueError(
+                "eta must be positive when inactive dimensions are present."
+            )
+
+        self.tau = (
+            0.2 + 0.3 * np.arange(self.active_dimension, dtype=float)
+            if self.tau is None
+            else _validate_vector(self.tau, self.active_dimension, "tau")
+        )
+        if not np.all(np.isfinite(self.tau)) or np.any(self.tau <= 0.0):
+            raise ValueError("tau must contain finite positive values.")
+        self.active_mean = (
+            np.zeros(self.active_dimension, dtype=float)
+            if self.active_mean is None
+            else _validate_vector(
+                self.active_mean,
+                self.active_dimension,
+                "active_mean",
+            )
+        )
+        if not np.all(np.isfinite(self.active_mean)):
+            raise ValueError("active_mean must contain finite values.")
+
+        if self.U is None:
+            self.U = random_orthogonal_matrix(
+                self.dimension,
+                random_state=self.random_state,
+            )[:, : self.active_dimension]
+        else:
+            self.U = np.asarray(self.U, dtype=float)
+            expected_shape = (self.dimension, self.active_dimension)
+            if self.U.shape != expected_shape:
+                raise ValueError(
+                    f"U must have shape {expected_shape}, got {self.U.shape}."
+                )
+            if not np.all(np.isfinite(self.U)):
+                raise ValueError("U must contain finite values.")
+            if not np.allclose(
+                self.U.T @ self.U,
+                np.eye(self.active_dimension),
+                atol=1e-10,
+                rtol=1e-10,
+            ):
+                raise ValueError("U must have orthonormal columns.")
+            self.U = self.U.copy()
+
+    @property
+    def inactive_variance(self) -> float | None:
+        """Return the scaled-coordinate inactive variance, if it exists."""
+
+        inactive_dimension = self.dimension - self.active_dimension
+        if inactive_dimension == 0:
+            return None
+        return inactive_dimension / self.eta
+
+    def __call__(self, x: np.ndarray) -> float | np.ndarray:
+        X, scalar_input = _as_points(x, self.dimension)
+        scaled = X / self.a
+        active_coordinates = scaled @ self.U
+        active_energy = np.sum(
+            ((active_coordinates - self.active_mean) / self.tau) ** 2,
+            axis=1,
+        )
+
+        inactive_dimension = self.dimension - self.active_dimension
+        if inactive_dimension == 0:
+            inactive_energy = 0.0
+        else:
+            # Orthogonal projection without forming the dense d-by-d projector.
+            inactive = scaled - active_coordinates @ self.U.T
+            inactive_energy = (
+                self.eta
+                / inactive_dimension
+                * np.sum(inactive * inactive, axis=1)
+            )
+        values = np.exp(-0.5 * (active_energy + inactive_energy))
+        return _restore_output(values, scalar_input)
+
+    def sample_normalized_on_domain(
+        self,
+        n_samples: int,
+        random_state: RandomState = None,
+    ) -> np.ndarray:
+        """Sample from density proportional to this Gaussian on [-a, a]^d."""
+
+        n_samples = int(n_samples)
+        if n_samples < 1:
+            raise ValueError("n_samples must be positive.")
+        rng = _as_rng(random_state)
+        samples = np.empty((n_samples, self.dimension), dtype=float)
+        n_accepted = 0
+        n_proposed = 0
+        max_batch = max(1, 1_000_000 // self.dimension)
+        max_proposals = max(100_000, 1000 * n_samples)
+
+        # Uniform rejection is exact here because 0 < f(x) <= 1 on the box.
+        while n_accepted < n_samples:
+            remaining = n_samples - n_accepted
+            batch_size = min(max_batch, max(1024, 4 * remaining))
+            candidates = rng.uniform(
+                -self.a,
+                self.a,
+                size=(batch_size, self.dimension),
+            )
+            n_proposed += batch_size
+            accepted = candidates[
+                rng.random(batch_size) < np.asarray(self(candidates), dtype=float)
+            ]
+            take = min(remaining, accepted.shape[0])
+            if take:
+                samples[n_accepted : n_accepted + take] = accepted[:take]
+                n_accepted += take
+            if n_accepted < n_samples and n_proposed >= max_proposals:
+                raise RuntimeError(
+                    "Gaussian rejection sampling acceptance is too low; "
+                    "check active_mean and tau."
+                )
+        return samples
 
 
 @dataclass
@@ -295,15 +535,15 @@ def default_gaussian_mixture_2d(beta: float = 1.0) -> GaussianMixtureFunction:
 
     centers = (
         (-1.5, -1.1),
-        (1.35, -1.2),
-        (-1.0, 1.45),
+        (1.95, -1.0),
+        (-1.2, 1.65),
         (1.4, 1.3),
     )
-    angles = (20.0, -35.0, 60.0, 5.0)
+    angles = (20.0, -30.0, 60.0, 5.0)
     spectra = (
         (2.55, 0.125),
-        (0.30, 5.00),
-        (2.75, 2.18),
+        (0.10, 5.00),
+        (1.70, 1.7),
         (0.42, 0.10),
     )
     components = tuple(
@@ -321,6 +561,38 @@ def default_gaussian_mixture_2d(beta: float = 1.0) -> GaussianMixtureFunction:
         weights=np.array([0.0, 1.30, 2.00, 0.0]),
         beta=beta,
         normalize_weights=True,
+    )
+
+
+def default_high_dim_gaussian_mixture(
+    dimension: int,
+    beta: float = 0.0,
+    random_state: RandomState = None,
+) -> GaussianMixtureFunction:
+    """Return the fixed two-component high-dimensional Gaussian benchmark."""
+
+    dimension = _validate_dimension(dimension, minimum=1)
+    rng = _as_rng(random_state)
+    center = 0.5 * np.ones(dimension)
+    components = tuple(
+        GaussianFunction(
+            dimension=dimension,
+            beta=0.0,
+            amplitude=1.0,
+            sharpness=8.0,
+            domain_scale=1.0,
+            condition_number=GAUSSIAN_DEFAULT_CONDITION_NUMBER,
+            q_mode="random",
+            random_state=rng,
+            mean=sign * center,
+        )
+        for sign in (-1.0, 1.0)
+    )
+    return GaussianMixtureFunction(
+        components=components,
+        weights=np.ones(2),
+        beta=beta,
+        normalize_weights=False,
     )
 
 
@@ -414,6 +686,23 @@ class RastriginFunction:
 def _paper_diagonal(dimension: int) -> np.ndarray:
     indices = np.arange(1, dimension + 1, dtype=float)
     return indices**-3
+
+
+def _geometric_precision_spectrum(
+    dimension: int,
+    condition_number: float,
+) -> np.ndarray:
+    """Return a trace-one geometric spectrum with the requested condition."""
+
+    if dimension == 1:
+        return np.ones(1)
+    indices = np.arange(dimension, dtype=float)
+    spectrum = np.exp(
+        -np.log(condition_number) * indices / (dimension - 1)
+    )
+    if np.any(spectrum == 0.0):
+        raise ValueError("condition_number is too large to represent the spectrum.")
+    return spectrum / np.sum(spectrum)
 
 
 def _resolve_rotation(

@@ -5,7 +5,12 @@ import pytest
 
 from art.domain import BoxDomain
 from examples.benchmark_functions import (
+    ActiveSubspaceGaussianFunction,
+    FIXED_SPHERICAL_AFFINE_OFFSET,
+    FIXED_SPHERICAL_AFFINE_RADII,
+    FIXED_SPHERICAL_AFFINE_VOLUME_FRACTION,
     GAUSSIAN_DEFAULT_INTERVAL,
+    GAUSSIAN_MIXTURE_DEFAULT_INTERVAL,
     PLANE_WAVE_DEFAULT_INTERVAL,
     QUADRATIC_DEFAULT_INTERVAL,
     RASTRIGIN_DEFAULT_INTERVAL,
@@ -19,10 +24,13 @@ from examples.benchmark_functions import (
     RosenbrockFunction,
     SphericalPiecewisePolynomialFunction,
     default_gaussian_mixture_2d,
+    default_high_dim_gaussian_mixture,
+    fixed_spherical_affine_pieces,
+    fixed_spherical_affine_radius,
     rotation_matrix_2d,
     sphere_radius_for_box_volume_fraction,
 )
-from examples.tree_2D_benchmark import add_output_offset
+from examples.tree_benchmark_helpers import add_output_offset
 
 
 def test_rotation_matrix_2d_supports_radians_and_degrees() -> None:
@@ -44,7 +52,7 @@ def test_paper_default_domains() -> None:
     rastrigin = BoxDomain.hypercube(2, *RASTRIGIN_DEFAULT_INTERVAL)
 
     assert np.array_equal(quadratic.bounds, [[-3.0, 3.0], [-3.0, 3.0]])
-    assert np.array_equal(gaussian.bounds, [[-3.0, 3.0], [-3.0, 3.0]])
+    assert np.array_equal(gaussian.bounds, [[-1.0, 1.0], [-1.0, 1.0]])
     assert np.array_equal(rosenbrock.bounds, [[-2.0, 3.0], [-2.0, 3.0]])
     assert np.array_equal(plane_wave.bounds, quadratic.bounds)
     assert np.array_equal(spherical.bounds, quadratic.bounds)
@@ -129,6 +137,45 @@ def test_spherical_piecewise_polynomial_validates_pieces_and_radius() -> None:
         SphericalPiecewisePolynomialFunction(piece_2d, piece_2d, radius=0.0)
 
 
+@pytest.mark.parametrize("dimension", range(2, 6))
+def test_fixed_spherical_affine_pieces_are_distinct_and_positive(
+    dimension: int,
+) -> None:
+    inside, outside = fixed_spherical_affine_pieces(dimension)
+    corners = np.array(np.meshgrid(*[(-3.0, 3.0)] * dimension)).reshape(
+        dimension, -1
+    ).T
+    radius = fixed_spherical_affine_radius(dimension)
+    minimum_jump = (
+        inside.beta
+        - outside.beta
+        - radius * np.linalg.norm(inside.w - outside.w)
+    )
+
+    assert not np.allclose(inside.w, outside.w)
+    assert inside.beta != outside.beta
+    assert np.min(inside(corners) + FIXED_SPHERICAL_AFFINE_OFFSET) >= 1.0
+    assert np.min(outside(corners) + FIXED_SPHERICAL_AFFINE_OFFSET) >= 1.0
+    assert minimum_jump >= 1.0
+
+
+@pytest.mark.parametrize(
+    ("dimension", "expected"),
+    tuple(FIXED_SPHERICAL_AFFINE_RADII.items()),
+)
+def test_fixed_spherical_affine_radii_match_tacc_presets(
+    dimension: int,
+    expected: float,
+) -> None:
+    assert fixed_spherical_affine_radius(dimension) == expected
+    assert FIXED_SPHERICAL_AFFINE_VOLUME_FRACTION == 0.5
+
+
+def test_fixed_spherical_affine_radius_rejects_unsupported_dimension() -> None:
+    with pytest.raises(ValueError, match="dimensions 2--5"):
+        fixed_spherical_affine_radius(6)
+
+
 def test_sphere_radius_matches_requested_box_volume_fraction() -> None:
     bounds = np.array([[-2.0, 2.0], [-1.0, 3.0], [-3.0, 1.0]])
     center = np.mean(bounds, axis=1)
@@ -200,10 +247,47 @@ def test_gaussian_caches_precision_and_supports_random_rotation() -> None:
 
     assert np.allclose(first.Q.T @ first.Q, np.eye(3))
     assert np.allclose(first.Q, second.Q)
+    assert first.condition_number == 16.0
     assert np.isclose(values[0], 2.0)
     assert values[1] > 1.0
     assert values[1] < 2.0
     assert id(first.precision) == precision_id
+
+
+def test_gaussian_default_precision_has_requested_trace_and_condition() -> None:
+    function = GaussianFunction(
+        dimension=5,
+        beta=0.0,
+        condition_number=100.0,
+        q_mode="random",
+        random_state=7,
+    )
+
+    eigenvalues = np.linalg.eigvalsh(function.precision)
+
+    assert np.isclose(np.sum(eigenvalues), 1.0)
+    assert np.isclose(eigenvalues[-1] / eigenvalues[0], 100.0)
+    assert np.allclose(
+        function.precision_spectrum,
+        function.precision_spectrum[0]
+        * 100.0 ** (-np.arange(5) / 4.0),
+    )
+
+
+def test_gaussian_sharpness_scale_and_amplitude() -> None:
+    function = GaussianFunction(
+        dimension=2,
+        beta=0.5,
+        amplitude=2.0,
+        sharpness=3.0,
+        domain_scale=2.0,
+        condition_number=1.0,
+    )
+    x = np.array([1.0, -1.0])
+    expected = 0.5 + 2.0 * np.exp(-0.5 * 3.0 * (x @ function.precision @ x) / 4.0)
+
+    assert np.isclose(function(np.zeros(2)), 2.5)
+    assert np.isclose(function(x), expected)
 
 
 def test_gaussian_accepts_full_sigma() -> None:
@@ -214,6 +298,65 @@ def test_gaussian_accepts_full_sigma() -> None:
 
     assert np.allclose(function.covariance, Sigma)
     assert np.isclose(function(x), expected)
+
+
+def test_active_subspace_gaussian_matches_explicit_formula_and_defaults() -> None:
+    function = ActiveSubspaceGaussianFunction(
+        dimension=5,
+        active_dimension=3,
+        eta=0.1,
+        a=2.0,
+        active_mean=np.array([0.1, -0.2, 0.3]),
+        random_state=11,
+    )
+    X = np.array(
+        [
+            [0.2, -0.4, 0.6, 0.1, -0.3],
+            [-0.5, 0.7, -0.1, 0.8, 0.4],
+        ]
+    )
+    scaled = X / function.a
+    active = scaled @ function.U
+    inactive = scaled - active @ function.U.T
+    energy = np.sum(
+        ((active - function.active_mean) / function.tau) ** 2,
+        axis=1,
+    ) + function.eta / 2.0 * np.sum(inactive**2, axis=1)
+
+    np.testing.assert_allclose(function.tau, [0.2, 0.5, 0.8])
+    np.testing.assert_allclose(function.U.T @ function.U, np.eye(3), atol=1e-12)
+    np.testing.assert_allclose(function(X), np.exp(-0.5 * energy))
+    assert function.inactive_variance == 20.0
+
+
+def test_active_subspace_gaussian_handles_fully_active_dimension() -> None:
+    function = ActiveSubspaceGaussianFunction(
+        dimension=3,
+        active_dimension=3,
+        eta=0.0,
+        random_state=3,
+    )
+    X = np.array([[0.0, 0.0, 0.0], [0.2, -0.1, 0.4]])
+    active = X @ function.U
+    expected = np.exp(-0.5 * np.sum((active / function.tau) ** 2, axis=1))
+
+    assert function.inactive_variance is None
+    np.testing.assert_allclose(function(X), expected)
+
+
+def test_active_subspace_gaussian_sampling_is_bounded_and_reproducible() -> None:
+    function = ActiveSubspaceGaussianFunction(
+        dimension=4,
+        active_dimension=2,
+        random_state=5,
+    )
+    first = function.sample_normalized_on_domain(100, random_state=17)
+    second = function.sample_normalized_on_domain(100, random_state=17)
+
+    assert first.shape == (100, 4)
+    assert np.all(first >= -function.a)
+    assert np.all(first <= function.a)
+    np.testing.assert_array_equal(first, second)
 
 
 def test_shifted_gaussian_and_mixture_evaluation() -> None:
@@ -244,7 +387,7 @@ def test_shifted_gaussian_and_mixture_evaluation() -> None:
 
 def test_default_gaussian_mixture_has_four_varied_components_in_domain() -> None:
     mixture = default_gaussian_mixture_2d()
-    low, high = GAUSSIAN_DEFAULT_INTERVAL
+    low, high = GAUSSIAN_MIXTURE_DEFAULT_INTERVAL
     centers = np.vstack([component.mean for component in mixture.components])
     precisions = np.stack([component.precision for component in mixture.components])
 
@@ -266,6 +409,28 @@ def test_default_gaussian_mixture_accepts_custom_beta() -> None:
     assert default.beta == 1.0
     assert zero_baseline.beta == 0.0
     assert np.allclose(default(X) - zero_baseline(X), 1.0)
+
+
+def test_default_high_dim_gaussian_mixture_is_literal_reproducible_sum() -> None:
+    first = default_high_dim_gaussian_mixture(5, random_state=7)
+    second = default_high_dim_gaussian_mixture(5, random_state=7)
+    X = np.array(
+        [
+            np.full(5, -0.5),
+            np.zeros(5),
+            np.full(5, 0.5),
+        ]
+    )
+
+    assert not first.normalize_weights
+    np.testing.assert_array_equal(first.weights, np.ones(2))
+    np.testing.assert_array_equal(first.components[0].mean, np.full(5, -0.5))
+    np.testing.assert_array_equal(first.components[1].mean, np.full(5, 0.5))
+    assert all(component.sharpness == 8.0 for component in first.components)
+    assert all(component.condition_number == 16.0 for component in first.components)
+    assert not np.allclose(first.components[0].Q, first.components[1].Q)
+    np.testing.assert_allclose(first(X), sum(component(X) for component in first.components))
+    np.testing.assert_allclose(first(X), second(X))
 
 
 def test_rosenbrock_defaults_and_custom_coefficients() -> None:

@@ -220,7 +220,7 @@ def main() -> None:
     parser.add_argument("--degree", type=int, default=1)
     parser.add_argument("--no-bias", action="store_true", help="Disable polynomial bias term for degree > 1.")
     parser.add_argument("--n-trials", type=int, default=20)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--low", type=float, default=-1.0)
     parser.add_argument("--high", type=float, default=1.0)
     parser.add_argument("--sample-multiplier", type=int, default=50)

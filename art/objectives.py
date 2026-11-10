@@ -2,19 +2,48 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal, TYPE_CHECKING
 
 import numpy as np
 
 from .models import (
+    AffineRidgeModel,
+    PolynomialRidgeModel,
     PreparedDesign,
     PreparedFeatureModel,
     RegressionModel,
     WeightedRegressionModel,
+    augment_features,
     ridge_solve_diagnostics,
 )
-from .timing import BuildTimingProfile
+from .timing import BuildTimingProfile, SplitterTimingProfile
+
+if TYPE_CHECKING:
+    from ._cuda_hybrid_gram import CudaWeightedGram
+
+
+def make_cuda_workspace(
+    model: WeightedRegressionModel,
+    X: np.ndarray,
+    y: np.ndarray,
+    prepared_design: PreparedDesign | None,
+    weight_floor: float,
+) -> CudaWeightedGram:
+    """Create a lazy workspace only for the built-in normal-equation models."""
+    if type(model) not in (AffineRidgeModel, PolynomialRidgeModel):
+        raise TypeError("CUDA Gram construction supports the built-in affine/polynomial models.")
+    if model.solver not in ("normal", "auto"):
+        raise ValueError("CUDA Gram construction requires solver='normal' or 'auto'.")
+    from ._cuda_hybrid_gram import CudaWeightedGram
+
+    if prepared_design is None and isinstance(model, PolynomialRidgeModel):
+        prepared_design = model.prepare_design(X)
+    design = (
+        prepared_design.matrix if prepared_design is not None else augment_features(X)
+    )
+    return CudaWeightedGram(design, y, weight_floor)
 
 
 def sigmoid(values: np.ndarray) -> np.ndarray:
@@ -51,6 +80,12 @@ class SoftObliqueRidgeObjective:
         default=None,
         repr=False,
     )
+    split_timing_profile: SplitterTimingProfile | None = field(
+        default=None,
+        repr=False,
+    )
+    optimizer: Literal["cpu", "hybrid_gram"] = "cpu"
+    gram_workspace: CudaWeightedGram | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.X = np.asarray(self.X, dtype=float)
@@ -65,6 +100,11 @@ class SoftObliqueRidgeObjective:
             raise ValueError("temperature must be positive.")
         if not hasattr(self.model_template, "fit_weighted"):
             raise TypeError("model_template must provide fit_weighted(X, y, weights).")
+        if (
+            self.optimizer == "hybrid_gram" and self.prepared_design is None
+            and isinstance(self.model_template, PolynomialRidgeModel)
+        ):
+            self.prepared_design = self.model_template.prepare_design(self.X)
         if self.prepared_design is not None:
             if not isinstance(self.model_template, PreparedFeatureModel):
                 raise TypeError(
@@ -78,6 +118,16 @@ class SoftObliqueRidgeObjective:
                 raise ValueError(
                     "Prepared design input dimension does not match X."
                 )
+        if self.optimizer not in ("cpu", "hybrid_gram"):
+            raise ValueError("The CPU objective supports optimizer='cpu' or 'hybrid_gram'.")
+        if self.gram_workspace is not None:
+            if self.optimizer != "hybrid_gram":
+                raise ValueError("A CUDA Gram workspace requires optimizer='hybrid_gram'.")
+            design = (
+                self.prepared_design.matrix
+                if self.prepared_design is not None else augment_features(self.X)
+            )
+            self.gram_workspace.validate(design, self.y, self.weight_floor)
 
     def evaluate(
         self,
@@ -89,7 +139,13 @@ class SoftObliqueRidgeObjective:
         theta = self._validate_theta(theta)
         w = theta[:-1]
         z = float(theta[-1])
-        pi = sigmoid((self.X @ w - z) / self.temperature)
+        sigmoid_timing = (
+            self.split_timing_profile.measure("sigmoid", count=True)
+            if self.split_timing_profile is not None
+            else nullcontext()
+        )
+        with sigmoid_timing:
+            pi = sigmoid((self.X @ w - z) / self.temperature)
 
         if reference is None:
             left_model, right_model = self._fit_models(pi)
@@ -141,11 +197,17 @@ class SoftObliqueRidgeObjective:
         if not isinstance(evaluation, SoftObjectiveResult):
             raise TypeError("evaluation must be a SoftObjectiveResult.")
         if evaluation.grad is None:
-            evaluation.grad = self._gradient(
-                evaluation.pi,
-                evaluation.residual_left,
-                evaluation.residual_right,
+            timing = (
+                self.split_timing_profile.measure("gradient", count=True)
+                if self.split_timing_profile is not None
+                else nullcontext()
             )
+            with timing:
+                evaluation.grad = self._gradient(
+                    evaluation.pi,
+                    evaluation.residual_left,
+                    evaluation.residual_right,
+                )
         return evaluation.grad
 
     def value_and_grad(
@@ -164,9 +226,12 @@ class SoftObliqueRidgeObjective:
         self,
         pi: np.ndarray,
     ) -> tuple[RegressionModel, RegressionModel]:
-        if self.timing_profile is None:
-            return self._fit_models_untimed(pi)
-        with self.timing_profile.measure("model_refit"):
+        build_timing = (
+            self.timing_profile.measure("model_refit")
+            if self.timing_profile is not None
+            else nullcontext()
+        )
+        with build_timing:
             return self._fit_models_untimed(pi)
 
     def _fit_models_untimed(
@@ -175,38 +240,66 @@ class SoftObliqueRidgeObjective:
     ) -> tuple[RegressionModel, RegressionModel]:
         left_model = self.model_template.clone()
         right_model = self.model_template.clone()
-        if self.prepared_design is None:
-            left_model.fit_weighted(
-                self.X,
-                self.y,
-                weights=1.0 - pi,
-                weight_floor=self.weight_floor,
-            )
-            right_model.fit_weighted(
-                self.X,
-                self.y,
-                weights=pi,
-                weight_floor=self.weight_floor,
-            )
-        else:
-            if not isinstance(left_model, PreparedFeatureModel) or not isinstance(
-                right_model, PreparedFeatureModel
-            ):
-                raise TypeError(
-                    "Prepared objective models must implement PreparedFeatureModel."
+        solve_timing = (
+            self.split_timing_profile.measure("least_squares", count=True)
+            if self.split_timing_profile is not None
+            else nullcontext()
+        )
+        with solve_timing:
+            if self.optimizer == "hybrid_gram":
+                if self.gram_workspace is None:
+                    self.gram_workspace = make_cuda_workspace(
+                        self.model_template, self.X, self.y,
+                        self.prepared_design, self.weight_floor,
+                    )
+                systems = self.gram_workspace.form_pair(pi)
+                for model, weights, system in zip(
+                    (left_model, right_model), (1.0 - pi, pi), systems
+                ):
+                    if self.prepared_design is None:
+                        model.fit_weighted(
+                            self.X, self.y, weights,
+                            weight_floor=self.weight_floor,
+                            normal_equations=system,
+                        )
+                    else:
+                        model.fit_weighted_design(
+                            self.prepared_design, self.y, weights,
+                            weight_floor=self.weight_floor,
+                            normal_equations=system,
+                        )
+            elif self.prepared_design is None:
+                left_model.fit_weighted(
+                    self.X,
+                    self.y,
+                    weights=1.0 - pi,
+                    weight_floor=self.weight_floor,
                 )
-            left_model.fit_weighted_design(
-                self.prepared_design,
-                self.y,
-                weights=1.0 - pi,
-                weight_floor=self.weight_floor,
-            )
-            right_model.fit_weighted_design(
-                self.prepared_design,
-                self.y,
-                weights=pi,
-                weight_floor=self.weight_floor,
-            )
+                right_model.fit_weighted(
+                    self.X,
+                    self.y,
+                    weights=pi,
+                    weight_floor=self.weight_floor,
+                )
+            else:
+                if not isinstance(left_model, PreparedFeatureModel) or not isinstance(
+                    right_model, PreparedFeatureModel
+                ):
+                    raise TypeError(
+                        "Prepared objective models must implement PreparedFeatureModel."
+                    )
+                left_model.fit_weighted_design(
+                    self.prepared_design,
+                    self.y,
+                    weights=1.0 - pi,
+                    weight_floor=self.weight_floor,
+                )
+                right_model.fit_weighted_design(
+                    self.prepared_design,
+                    self.y,
+                    weights=pi,
+                    weight_floor=self.weight_floor,
+                )
         return left_model, right_model
 
     def _predict_model(self, model: RegressionModel) -> np.ndarray:

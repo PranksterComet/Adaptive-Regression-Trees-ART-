@@ -1,0 +1,505 @@
+{
+  "rosenbrock": {
+    "5": {
+      "source_report": "results/rosenbrock/dim_5/degree_2/thinning_1/report.txt",
+      "bounds": [
+        [
+          -2.0,
+          3.0
+        ],
+        [
+          -2.0,
+          3.0
+        ],
+        [
+          -2.0,
+          3.0
+        ],
+        [
+          -2.0,
+          3.0
+        ],
+        [
+          -2.0,
+          3.0
+        ]
+      ],
+      "target": {
+        "a": 1.0,
+        "b": 100.0,
+        "offset": 1.0
+      }
+    }
+  },
+  "rastrigin": {
+    "3": {
+      "source_report": "results/rastrigin/targeted_deep/degree_2/dim_3/half_width_5p12/depth_22/sample_multiplier_50/seed_1/report.txt",
+      "bounds": [
+        [
+          -5.12,
+          5.12
+        ],
+        [
+          -5.12,
+          5.12
+        ],
+        [
+          -5.12,
+          5.12
+        ]
+      ],
+      "target": {
+        "A": 10.0,
+        "offset": 1.0
+      }
+    },
+    "4": {
+      "source_report": "results/rastrigin/targeted_deep/degree_2/dim_4/half_width_2p5/depth_21/sample_multiplier_50/seed_1/report.txt",
+      "bounds": [
+        [
+          -2.5,
+          2.5
+        ],
+        [
+          -2.5,
+          2.5
+        ],
+        [
+          -2.5,
+          2.5
+        ],
+        [
+          -2.5,
+          2.5
+        ]
+      ],
+      "target": {
+        "A": 10.0,
+        "offset": 1.0
+      }
+    },
+    "5": {
+      "source_report": "results/rastrigin/targeted_deep/degree_2/dim_5/half_width_1p5/depth_20/sample_multiplier_50/seed_1/report.txt",
+      "bounds": [
+        [
+          -1.5,
+          1.5
+        ],
+        [
+          -1.5,
+          1.5
+        ],
+        [
+          -1.5,
+          1.5
+        ],
+        [
+          -1.5,
+          1.5
+        ],
+        [
+          -1.5,
+          1.5
+        ]
+      ],
+      "target": {
+        "A": 10.0,
+        "offset": 1.0
+      }
+    }
+  },
+  "plane_wave": {
+    "3": {
+      "source_report": "results/plane_wave/intrinsic_dimension_1/dense_signs/frequency_4/dim_3/degree_1/seed_1/report.txt",
+      "bounds": [
+        [
+          -3.0,
+          3.0
+        ],
+        [
+          -3.0,
+          3.0
+        ],
+        [
+          -3.0,
+          3.0
+        ]
+      ],
+      "target": {
+        "beta": 0.0,
+        "amplitude": 1.0,
+        "frequency": 4.0,
+        "normal": [
+          0.5773502691896258,
+          -0.5773502691896258,
+          0.5773502691896258
+        ],
+        "phase": 0.0,
+        "feature_mode": "explicit",
+        "offset": 2.0
+      }
+    },
+    "5": {
+      "source_report": "results/plane_wave/intrinsic_dimension_1/dense_signs/frequency_4/dim_5/degree_1/seed_1/report.txt",
+      "bounds": [
+        [
+          -3.0,
+          3.0
+        ],
+        [
+          -3.0,
+          3.0
+        ],
+        [
+          -3.0,
+          3.0
+        ],
+        [
+          -3.0,
+          3.0
+        ],
+        [
+          -3.0,
+          3.0
+        ]
+      ],
+      "target": {
+        "beta": 0.0,
+        "amplitude": 1.0,
+        "frequency": 4.0,
+        "normal": [
+          0.4472135954999579,
+          -0.4472135954999579,
+          0.4472135954999579,
+          0.4472135954999579,
+          -0.4472135954999579
+        ],
+        "phase": 0.0,
+        "feature_mode": "explicit",
+        "offset": 2.0
+      }
+    },
+    "8": {
+      "source_report": "results/plane_wave/intrinsic_dimension_1/dense_signs/frequency_4/dim_8/degree_1/seed_1/report.txt",
+      "bounds": [
+        [
+          -3.0,
+          3.0
+        ],
+        [
+          -3.0,
+          3.0
+        ],
+        [
+          -3.0,
+          3.0
+        ],
+        [
+          -3.0,
+          3.0
+        ],
+        [
+          -3.0,
+          3.0
+        ],
+        [
+          -3.0,
+          3.0
+        ],
+        [
+          -3.0,
+          3.0
+        ],
+        [
+          -3.0,
+          3.0
+        ]
+      ],
+      "target": {
+        "beta": 0.0,
+        "amplitude": 1.0,
+        "frequency": 4.0,
+        "normal": [
+          0.35355339059327373,
+          -0.35355339059327373,
+          0.35355339059327373,
+          0.35355339059327373,
+          -0.35355339059327373,
+          -0.35355339059327373,
+          0.35355339059327373,
+          -0.35355339059327373
+        ],
+        "phase": 0.0,
+        "feature_mode": "explicit",
+        "offset": 2.0
+      }
+    }
+  },
+  "spherical_piecewise": {
+    "2": {
+      "source_report": "results/spherical_piecewise/fixed_affine/volume_fraction_0.5/depth_20/degree_1/dim_2/seed_1/report.txt",
+      "bounds": [
+        [
+          -3.0,
+          3.0
+        ],
+        [
+          -3.0,
+          3.0
+        ]
+      ],
+      "target": {
+        "radius": 2.394139996923,
+        "radius_source": "explicit",
+        "requested_volume_fraction": null,
+        "volume_probe_size": 100000,
+        "center": [
+          0.0,
+          0.0
+        ],
+        "piece_degree": 1,
+        "piece_mode": "fixed_affine",
+        "inside_beta": 5.0,
+        "inside_linear_coefficients": [
+          -0.25,
+          0.35
+        ],
+        "outside_beta": 0.0,
+        "outside_linear_coefficients": [
+          0.4,
+          -0.3
+        ],
+        "offset": 4.15
+      }
+    },
+    "3": {
+      "source_report": "results/spherical_piecewise/fixed_affine/volume_fraction_0.5/depth_20/degree_1/dim_3/seed_1/report.txt",
+      "bounds": [
+        [
+          -3.0,
+          3.0
+        ],
+        [
+          -3.0,
+          3.0
+        ],
+        [
+          -3.0,
+          3.0
+        ]
+      ],
+      "target": {
+        "radius": 2.954149913692,
+        "radius_source": "explicit",
+        "requested_volume_fraction": null,
+        "volume_probe_size": 100000,
+        "center": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "piece_degree": 1,
+        "piece_mode": "fixed_affine",
+        "inside_beta": 5.0,
+        "inside_linear_coefficients": [
+          -0.25,
+          0.35,
+          -0.15
+        ],
+        "outside_beta": 0.0,
+        "outside_linear_coefficients": [
+          0.4,
+          -0.3,
+          0.2
+        ],
+        "offset": 4.15
+      }
+    },
+    "4": {
+      "source_report": "results/spherical_piecewise/fixed_affine/volume_fraction_0.5/depth_20/degree_1/dim_4/seed_1/report.txt",
+      "bounds": [
+        [
+          -3.0,
+          3.0
+        ],
+        [
+          -3.0,
+          3.0
+        ],
+        [
+          -3.0,
+          3.0
+        ],
+        [
+          -3.0,
+          3.0
+        ]
+      ],
+      "target": {
+        "radius": 3.418315145003,
+        "radius_source": "explicit",
+        "requested_volume_fraction": null,
+        "volume_probe_size": 100000,
+        "center": [
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "piece_degree": 1,
+        "piece_mode": "fixed_affine",
+        "inside_beta": 5.0,
+        "inside_linear_coefficients": [
+          -0.25,
+          0.35,
+          -0.15,
+          0.2
+        ],
+        "outside_beta": 0.0,
+        "outside_linear_coefficients": [
+          0.4,
+          -0.3,
+          0.2,
+          -0.1
+        ],
+        "offset": 4.15
+      }
+    },
+    "5": {
+      "source_report": "results/spherical_piecewise/fixed_affine/volume_fraction_0.5/depth_20/degree_1/dim_5/seed_1/report.txt",
+      "bounds": [
+        [
+          -3.0,
+          3.0
+        ],
+        [
+          -3.0,
+          3.0
+        ],
+        [
+          -3.0,
+          3.0
+        ],
+        [
+          -3.0,
+          3.0
+        ],
+        [
+          -3.0,
+          3.0
+        ]
+      ],
+      "target": {
+        "radius": 3.83470329729,
+        "radius_source": "explicit",
+        "requested_volume_fraction": null,
+        "volume_probe_size": 100000,
+        "center": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "piece_degree": 1,
+        "piece_mode": "fixed_affine",
+        "inside_beta": 5.0,
+        "inside_linear_coefficients": [
+          -0.25,
+          0.35,
+          -0.15,
+          0.2,
+          -0.1
+        ],
+        "outside_beta": 0.0,
+        "outside_linear_coefficients": [
+          0.4,
+          -0.3,
+          0.2,
+          -0.1,
+          0.05
+        ],
+        "offset": 4.15
+      }
+    }
+  },
+  "shallow_water_space_time": {
+    "5": {
+      "source_report": "results/shallow_water/space_time_5d/degree_2/depth_17/sample_multiplier_50/seed_1/report.txt",
+      "bounds": [
+        [
+          -1.0,
+          1.0
+        ],
+        [
+          -1.0,
+          1.0
+        ],
+        [
+          -1.0,
+          1.0
+        ],
+        [
+          -1.0,
+          1.0
+        ],
+        [
+          -1.0,
+          1.0
+        ]
+      ],
+      "target": {
+        "input_coordinates": "normalized [-1, 1]^5",
+        "parameter_names": [
+          "eta_left",
+          "eta_right",
+          "bump_height",
+          "position",
+          "time"
+        ],
+        "physical_parameter_bounds": [
+          [
+            1.5,
+            3.0
+          ],
+          [
+            0.6,
+            1.2
+          ],
+          [
+            0.1,
+            0.4
+          ],
+          [
+            0.0,
+            5.0
+          ],
+          [
+            0.0,
+            0.75
+          ]
+        ],
+        "cells": 500,
+        "channel_bounds": [
+          -10.0,
+          10.0
+        ],
+        "dam_position": 0.0,
+        "bump_center": 2.0,
+        "bump_width": 0.75,
+        "gravity": 9.81,
+        "dry_tolerance": 1e-06,
+        "quantity_of_interest": "water depth at input position and time",
+        "sensor_position_range": [
+          0.0,
+          5.0
+        ],
+        "time_range": [
+          0.0,
+          0.75
+        ],
+        "spatial_interpolation": "linear interpolation of cell-center depths, including T=0"
+      }
+    }
+  }
+}

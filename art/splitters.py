@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, get_args, runtime_checkable
 
 import numpy as np
 
@@ -23,11 +24,13 @@ from .models import (
 )
 from .objectives import SoftObliqueRidgeObjective
 from .optimizers import AdaptiveAlpha, armijo_backtracking
-from .timing import BuildTimingProfile
+from .timing import BuildTimingProfile, SplitterTimingCategory, SplitterTimingProfile
 
 
 HingeMode = Literal["max", "min", "both"]
 ResolvedHingeMode = Literal["max", "min"]
+Optimizer = Literal["cpu", "hybrid_gram", "cupy_qr", "cupy_cholesky", "cupy_batched_cholesky"]
+OPTIMIZERS = get_args(Optimizer)
 
 
 class SplitNotFoundError(RuntimeError):
@@ -110,16 +113,21 @@ def _is_high_condition(value: object) -> bool:
 
 @dataclass
 class SplitResult:
-    """Result returned by a splitter."""
+    """A split, optionally carrying hard models and their measured loss.
+
+    Builder-only partition proposals leave models/loss/gains as None. Children
+    are topped up and fitted before becoming final tree nodes. Standalone
+    split() calls retain hard models by default.
+    """
 
     w: np.ndarray
     z: float
-    left_model: RegressionModel
-    right_model: RegressionModel
-    loss: float
+    left_model: RegressionModel | None
+    right_model: RegressionModel | None
+    loss: float | None
     parent_loss: float
-    split_gain: float
-    relative_split_gain: float
+    split_gain: float | None
+    relative_split_gain: float | None
     n_left: int
     n_right: int
     converged: bool
@@ -127,8 +135,15 @@ class SplitResult:
     stop_reason: str
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def has_hard_fit(self) -> bool:
+        return self.loss is not None
+
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Predict with the two hard-partition models."""
+
+        if not self.has_hard_fit:
+            raise RuntimeError("This partition has no hard models; top up and fit its children first.")
 
         X = np.asarray(X, dtype=float)
         if X.ndim == 1:
@@ -150,6 +165,9 @@ class SplitResult:
         prepared_design: PreparedDesign,
     ) -> np.ndarray:
         """Predict from raw routing coordinates and an aligned design matrix."""
+
+        if not self.has_hard_fit:
+            raise RuntimeError("This partition has no hard models; top up and fit its children first.")
 
         X = np.asarray(X, dtype=float)
         if X.ndim != 2 or X.shape[1] != self.w.shape[0]:
@@ -178,6 +196,17 @@ class SplitResult:
         return predictions
 
 
+def _partition_result(theta, n, n_right, parent_loss, converged, metadata):
+    """Export geometry/counts without fabricating hard losses or child models."""
+    return SplitResult(
+        w=theta[:-1].copy(), z=float(theta[-1]), left_model=None, right_model=None,
+        loss=None, parent_loss=float(parent_loss), split_gain=None, relative_split_gain=None,
+        n_left=n - int(n_right), n_right=int(n_right), converged=converged,
+        n_iters=int(metadata["n_iters"]), stop_reason=str(metadata["stop_reason"]),
+        metadata={**metadata, "hard_refit": False},
+    )
+
+
 @dataclass
 class SoftObliqueSplitter:
     """Soft sigmoid oblique splitter optimized by projected gradient descent."""
@@ -187,8 +216,9 @@ class SoftObliqueSplitter:
     max_iters: int = 100
     grad_atol: float = 1e-8
     grad_rtol: float = 1e-5
-    min_side_points: int = 2
-    min_side_fraction: float = 0.0
+    min_side_points: int = 1
+    min_side_fraction: float = 0.05
+    min_side_fallback: bool = False
     n_restarts: int = 1
     alpha0: float = 1.0
     rho: float = 0.5
@@ -204,11 +234,20 @@ class SoftObliqueSplitter:
     weight_floor: float = 1e-12
     refit_during_line_search: bool = False
     random_state: int | np.random.Generator | None = None
+    split_timing_profile: SplitterTimingProfile | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     _timing_profile: BuildTimingProfile | None = field(
         default=None,
         init=False,
         repr=False,
     )
+    optimizer: Optimizer = "cpu"
+    backtrack_batch_size: int = 8
+    qr_parallel: bool = True
+    Xw_refresh: int = 32
 
     def split(
         self,
@@ -217,10 +256,27 @@ class SoftObliqueSplitter:
         parent_model: RegressionModel | None = None,
         parent_loss: float | None = None,
         prepared_design: PreparedDesign | None = None,
+        *,
+        gram_workspace=None,
+        qr_workspace=None,
+        cholesky_workspace=None,
+        hard_refit: bool = True,
     ) -> SplitResult:
         X = np.asarray(X, dtype=float)
         y = np.asarray(y, dtype=float).reshape(-1)
         self._validate_inputs(X, y)
+        if not isinstance(hard_refit, (bool, np.bool_)):
+            raise ValueError("hard_refit must be a boolean.")
+        if not hard_refit and self.n_restarts != 1:
+            raise ValueError("Skipping hard refits requires n_restarts == 1.")
+        if self.optimizer not in OPTIMIZERS:
+            raise ValueError(f"optimizer must be one of {OPTIMIZERS}.")
+        if self.optimizer == "cupy_batched_cholesky":
+            raise ValueError("cupy_batched_cholesky requires a BFS builder or BatchedOptimizerWorkspace.")
+        if self.optimizer in ("cupy_qr", "cupy_cholesky"):
+            from ._cuda_optimizer import validate_gpu_options
+
+            validate_gpu_options(self)
         if prepared_design is None and isinstance(
             self.model_template, PreparedFeatureModel
         ):
@@ -243,6 +299,22 @@ class SoftObliqueSplitter:
             prepared_design,
         )
         parent_solve = ridge_solve_diagnostics(parent_model)
+        if self.optimizer == "cupy_qr":
+            from ._cuda_optimizer import split_cuda_qr
+
+            return split_cuda_qr(
+                self, X, y, rng, parent_loss, required_side_points, parent_solve,
+                prepared_design, qr_workspace,
+                hard_refit=hard_refit,
+            )
+        if self.optimizer == "cupy_cholesky":
+            from ._cuda_optimizer import split_cuda_cholesky
+
+            return split_cuda_cholesky(
+                self, X, y, rng, parent_loss, required_side_points, parent_solve,
+                prepared_design, cholesky_workspace,
+                hard_refit=hard_refit,
+            )
         objective = SoftObliqueRidgeObjective(
             temperature=self.temperature,
             model_template=self.model_template,
@@ -251,9 +323,13 @@ class SoftObliqueSplitter:
             weight_floor=self.weight_floor,
             prepared_design=prepared_design,
             timing_profile=self._timing_profile,
+            split_timing_profile=self.split_timing_profile,
+            optimizer=self.optimizer,
+            gram_workspace=gram_workspace,
         )
 
         best: SplitResult | None = None
+        best_fallback: SplitResult | None = None
         last_failure: SplitNotFoundError | None = None
         for _ in range(max(1, self.n_restarts)):
             theta0 = self._initialize_theta(X, rng)
@@ -264,21 +340,27 @@ class SoftObliqueSplitter:
                     parent_loss=parent_loss,
                     required_side_points=required_side_points,
                     parent_solve=parent_solve,
+                    hard_refit=hard_refit,
                 )
             except SplitNotFoundError as exc:
                 last_failure = exc
                 continue
-            if best is None or result.loss < best.loss:
+            if bool(result.metadata.get("min_side_fallback", False)):
+                if best_fallback is None or result.loss < best_fallback.loss:
+                    best_fallback = result
+            elif best is None or result.loss < best.loss:
                 best = result
 
-        if best is None:
-            if last_failure is not None:
-                raise last_failure
-            raise SplitNotFoundError(
-                "invalid_split",
-                "SoftObliqueSplitter could not find a nondegenerate split.",
-            )
-        return best
+        if best is not None:
+            return best
+        if best_fallback is not None:
+            return best_fallback
+        if last_failure is not None:
+            raise last_failure
+        raise SplitNotFoundError(
+            "invalid_split",
+            "SoftObliqueSplitter could not find a nondegenerate split.",
+        )
 
     def _optimize_from_initialization(
         self,
@@ -287,14 +369,22 @@ class SoftObliqueSplitter:
         parent_loss: float,
         required_side_points: int,
         parent_solve: dict[str, object] | None,
-    ) -> SplitResult | None:
+        hard_refit: bool = True,
+    ) -> SplitResult:
         theta = project_unit_w(theta0)
         current = objective.value_and_grad(theta)
         if current.grad is None or current.loss is None:
             raise RuntimeError("Initial objective evaluation is incomplete.")
-        projected_grad = project_unit_w_gradient(theta, current.grad)
-        initial_grad_norm = float(np.linalg.norm(projected_grad))
+        with self._split_timing_context("gradient"):
+            projected_grad = project_unit_w_gradient(theta, current.grad)
+            initial_grad_norm = float(np.linalg.norm(projected_grad))
         grad_tolerance = self.grad_atol + self.grad_rtol * initial_grad_norm
+        n_right = int(np.count_nonzero(current.pi >= 0.5))
+        initial_is_feasible = (
+            min(n_right, current.pi.size - n_right) >= required_side_points
+        )
+        last_feasible_theta = theta.copy() if initial_is_feasible else None
+        last_feasible_iteration = 0 if initial_is_feasible else None
         loss_history = [current.loss]
         line_search_loss_history = []
         grad_norm_history = [initial_grad_norm]
@@ -353,6 +443,8 @@ class SoftObliqueSplitter:
             def candidate_value(candidate: np.ndarray) -> float:
                 nonlocal trial_evaluation
                 reference = None if self.refit_during_line_search else current
+                if self.split_timing_profile is not None:
+                    self.split_timing_profile.count_line_search_candidate()
                 trial_evaluation = objective.evaluate(
                     candidate,
                     reference=reference,
@@ -361,16 +453,19 @@ class SoftObliqueSplitter:
 
             while True:
                 alpha_start = alpha_controller.alpha if self.adaptive_alpha else alpha_fixed
-                line_search = armijo_backtracking(
-                    value_fn=candidate_value,
-                    candidate_fn=lambda alpha: project_unit_w(theta + alpha * direction),
-                    current_value=current.loss,
-                    directional_derivative=directional_derivative,
-                    alpha0=alpha_start,
-                    rho=self.rho,
-                    c=self.armijo_c,
-                    max_backtracks=self.max_backtracks,
-                )
+                with self._split_timing_context("backtracking", count=True):
+                    line_search = armijo_backtracking(
+                        value_fn=candidate_value,
+                        candidate_fn=lambda alpha: project_unit_w(
+                            theta + alpha * direction
+                        ),
+                        current_value=current.loss,
+                        directional_derivative=directional_derivative,
+                        alpha0=alpha_start,
+                        rho=self.rho,
+                        c=self.armijo_c,
+                        max_backtracks=self.max_backtracks,
+                    )
 
                 if self.adaptive_alpha:
                     alpha_controller.update(line_search, rho=self.rho)
@@ -409,8 +504,13 @@ class SoftObliqueSplitter:
             if current.grad is None or current.loss is None:
                 raise RuntimeError("Accepted objective evaluation is incomplete.")
             loss_history.append(current.loss)
-            projected_grad = project_unit_w_gradient(theta, current.grad)
-            grad_norm_history.append(float(np.linalg.norm(projected_grad)))
+            with self._split_timing_context("gradient"):
+                projected_grad = project_unit_w_gradient(theta, current.grad)
+                grad_norm_history.append(float(np.linalg.norm(projected_grad)))
+            n_right = int(np.count_nonzero(current.pi >= 0.5))
+            if min(n_right, current.pi.size - n_right) >= required_side_points:
+                last_feasible_theta = theta.copy()
+                last_feasible_iteration = len(loss_history) - 1
             left_cond_history.append(
                 _solve_field(current, "left", "cond_estimate")
             )
@@ -444,44 +544,60 @@ class SoftObliqueSplitter:
                 "left_solver_history": left_solver_history,
                 "right_solver_history": right_solver_history,
             }
+        metadata = {
+            "soft_loss_history": loss_history,
+            "line_search_loss_history": line_search_loss_history,
+            "projected_grad_norm_history": grad_norm_history,
+            "left_cond_estimate_history": left_cond_history,
+            "right_cond_estimate_history": right_cond_history,
+            "left_condition_estimator_history": left_condition_estimator_history,
+            "right_condition_estimator_history": right_condition_estimator_history,
+            **solver_history_metadata,
+            "step_size_history": step_history,
+            "backtrack_history": backtrack_history,
+            "stop_reason": stop_reason,
+            "temperature": self.temperature,
+            "adaptive_alpha": self.adaptive_alpha,
+            "refit_during_line_search": self.refit_during_line_search,
+            "initial_grad_norm": initial_grad_norm,
+            "final_grad_norm": grad_norm_history[-1],
+            "n_iters": len(loss_history) - 1,
+            "grad_tolerance": grad_tolerance,
+            "final_alpha": alpha_controller.alpha if self.adaptive_alpha else alpha_fixed,
+            "alpha_min_saturated": bool(
+                self.adaptive_alpha and alpha_controller.alpha <= self.alpha_min
+            ),
+            "alpha_max_saturated": bool(
+                self.adaptive_alpha and alpha_controller.alpha >= self.alpha_max
+            ),
+            "final_soft_metadata": current.metadata,
+            "parent_solve": parent_solve,
+            "high_model_conditioning": any(
+                _is_high_condition(value) for value in conditioning_values
+            ),
+        }
+        final_n_right = int(np.count_nonzero(current.pi >= 0.5))
+        final_is_feasible = (
+            min(final_n_right, current.pi.size - final_n_right)
+            >= required_side_points
+        )
+        if (
+            not final_is_feasible
+            and self.min_side_fallback
+            and last_feasible_theta is not None
+        ):
+            theta = last_feasible_theta
+            metadata["min_side_fallback"] = True
+            metadata["fallback_iteration"] = last_feasible_iteration
+
         return self._make_hard_result(
             objective=objective,
             theta=theta,
             parent_loss=parent_loss,
             converged=converged,
             required_side_points=required_side_points,
-            metadata={
-                "soft_loss_history": loss_history,
-                "line_search_loss_history": line_search_loss_history,
-                "projected_grad_norm_history": grad_norm_history,
-                "left_cond_estimate_history": left_cond_history,
-                "right_cond_estimate_history": right_cond_history,
-                "left_condition_estimator_history": left_condition_estimator_history,
-                "right_condition_estimator_history": right_condition_estimator_history,
-                **solver_history_metadata,
-                "step_size_history": step_history,
-                "backtrack_history": backtrack_history,
-                "stop_reason": stop_reason,
-                "temperature": self.temperature,
-                "adaptive_alpha": self.adaptive_alpha,
-                "refit_during_line_search": self.refit_during_line_search,
-                "initial_grad_norm": initial_grad_norm,
-                "final_grad_norm": grad_norm_history[-1],
-                "n_iters": len(loss_history) - 1,
-                "grad_tolerance": grad_tolerance,
-                "final_alpha": alpha_controller.alpha if self.adaptive_alpha else alpha_fixed,
-                "alpha_min_saturated": bool(
-                    self.adaptive_alpha and alpha_controller.alpha <= self.alpha_min
-                ),
-                "alpha_max_saturated": bool(
-                    self.adaptive_alpha and alpha_controller.alpha >= self.alpha_max
-                ),
-                "final_soft_metadata": current.metadata,
-                "parent_solve": parent_solve,
-                "high_model_conditioning": any(
-                    _is_high_condition(value) for value in conditioning_values
-                ),
-            },
+            metadata=metadata,
+            hard_refit=hard_refit,
         )
 
     def _make_hard_result(
@@ -492,6 +608,7 @@ class SoftObliqueSplitter:
         converged: bool,
         required_side_points: int,
         metadata: dict[str, Any],
+        hard_refit: bool = True,
     ) -> SplitResult:
         X = objective.X
         y = objective.y
@@ -514,11 +631,17 @@ class SoftObliqueSplitter:
                 },
             )
 
+        metadata = {**metadata, "hard_refit": bool(hard_refit),
+                    "required_side_points": required_side_points, "n_left": n_left, "n_right": n_right}
+        if not hard_refit:
+            return _partition_result(theta, len(y), n_right, parent_loss, converged, metadata)
+
         left_model = self.model_template.clone()
         right_model = self.model_template.clone()
         if objective.prepared_design is None:
-            left_model.fit(X[~right_mask], y[~right_mask])
-            right_model.fit(X[right_mask], y[right_mask])
+            with self._split_timing_context("least_squares", count=True):
+                left_model.fit(X[~right_mask], y[~right_mask])
+                right_model.fit(X[right_mask], y[right_mask])
             left_predictions = left_model.predict(X[~right_mask])
             right_predictions = right_model.predict(X[right_mask])
         else:
@@ -530,8 +653,9 @@ class SoftObliqueSplitter:
                 )
             left_design = objective.prepared_design.subset(~right_mask)
             right_design = objective.prepared_design.subset(right_mask)
-            left_model.fit_design(left_design, y[~right_mask])
-            right_model.fit_design(right_design, y[right_mask])
+            with self._split_timing_context("least_squares", count=True):
+                left_model.fit_design(left_design, y[~right_mask])
+                right_model.fit_design(right_design, y[right_mask])
             left_predictions = left_model.predict_design(left_design)
             right_predictions = right_model.predict_design(right_design)
 
@@ -634,6 +758,16 @@ class SoftObliqueSplitter:
             return self.random_state
         return np.random.default_rng(self.random_state)
 
+    def _split_timing_context(
+        self,
+        category: SplitterTimingCategory,
+        *,
+        count: bool = False,
+    ):
+        if self.split_timing_profile is None:
+            return nullcontext()
+        return self.split_timing_profile.measure(category, count=count)
+
 
 @dataclass
 class HingeAffineSplitter:
@@ -651,8 +785,9 @@ class HingeAffineSplitter:
     mu: float = 1.0
     max_iters: int = 100
     tol: float = 1e-6
-    min_side_points: int = 2
-    min_side_fraction: float = 0.0
+    min_side_points: int = 1
+    min_side_fraction: float = 0.05
+    min_side_fallback: bool = False
     n_restarts: int = 5
     init_scale: float = 1e-2
     random_state: int | np.random.Generator | None = None
@@ -696,6 +831,7 @@ class HingeAffineSplitter:
             parent_loss = float(parent_loss)
 
         best: SplitResult | None = None
+        best_fallback: SplitResult | None = None
         last_failure: SplitNotFoundError | None = None
         required_side_points = self._required_side_points(X.shape[0])
         modes: tuple[ResolvedHingeMode, ...] = ("max", "min") if self.mode == "both" else (self.mode,)
@@ -720,17 +856,22 @@ class HingeAffineSplitter:
                 except SplitNotFoundError as exc:
                     last_failure = exc
                     continue
-                if best is None or result.loss < best.loss:
+                if bool(result.metadata.get("min_side_fallback", False)):
+                    if best_fallback is None or result.loss < best_fallback.loss:
+                        best_fallback = result
+                elif best is None or result.loss < best.loss:
                     best = result
 
-        if best is None:
-            if last_failure is not None:
-                raise last_failure
-            raise SplitNotFoundError(
-                "invalid_split",
-                "HingeAffineSplitter could not find a nondegenerate split.",
-            )
-        return best
+        if best is not None:
+            return best
+        if best_fallback is not None:
+            return best_fallback
+        if last_failure is not None:
+            raise last_failure
+        raise SplitNotFoundError(
+            "invalid_split",
+            "HingeAffineSplitter could not find a nondegenerate split.",
+        )
 
     def _fit_from_initialization(
         self,
@@ -764,6 +905,17 @@ class HingeAffineSplitter:
             diagnostics["left_solver_history"] = []
             diagnostics["right_solver_history"] = []
 
+        initial_active1 = self._active_theta1(X_aug, theta1, theta2, mode)
+        initial_n1 = int(np.count_nonzero(initial_active1))
+        initial_is_feasible = (
+            min(initial_n1, initial_active1.size - initial_n1)
+            >= required_side_points
+        )
+        last_feasible_theta1 = theta1.copy() if initial_is_feasible else None
+        last_feasible_theta2 = theta2.copy() if initial_is_feasible else None
+        last_feasible_iteration = 0 if initial_is_feasible else None
+        fallback_used = False
+
         for iteration in range(self.max_iters):
             active1 = self._active_theta1(X_aug, theta1, theta2, mode)
             n1 = int(np.sum(active1))
@@ -773,6 +925,9 @@ class HingeAffineSplitter:
                 diagnostics["initial_n_left"] = n_left
                 diagnostics["initial_n_right"] = n_right
             if n1 < required_side_points or n2 < required_side_points:
+                if self.min_side_fallback and last_feasible_theta1 is not None:
+                    fallback_used = True
+                    break
                 raise SplitNotFoundError(
                     "min_side_points",
                     "HingeAffineSplitter produced an intermediate partition below the minimum side count.",
@@ -788,6 +943,9 @@ class HingeAffineSplitter:
                         "failure_stage": "intermediate_partition",
                     },
                 )
+            last_feasible_theta1 = theta1.copy()
+            last_feasible_theta2 = theta2.copy()
+            last_feasible_iteration = iteration
 
             theta1_solve = self._fit_theta(X_aug[active1], y[active1])
             theta2_solve = self._fit_theta(X_aug[~active1], y[~active1])
@@ -816,12 +974,36 @@ class HingeAffineSplitter:
                 break
             previous_active1 = active1
 
+        if not fallback_used:
+            final_active1 = self._active_theta1(X_aug, theta1, theta2, mode)
+            final_n1 = int(np.count_nonzero(final_active1))
+            final_is_feasible = (
+                min(final_n1, final_active1.size - final_n1)
+                >= required_side_points
+            )
+            if final_is_feasible:
+                last_feasible_theta1 = theta1.copy()
+                last_feasible_theta2 = theta2.copy()
+                last_feasible_iteration = len(loss_history)
+            elif self.min_side_fallback and last_feasible_theta1 is not None:
+                fallback_used = True
+
+        stop_reason = "converged" if converged else "max_iters"
+        if fallback_used:
+            if last_feasible_theta1 is None or last_feasible_theta2 is None:
+                raise RuntimeError("Missing feasible HRT fallback state.")
+            theta1 = last_feasible_theta1
+            theta2 = last_feasible_theta2
+            converged = False
+            stop_reason = "min_side_fallback"
+            diagnostics["min_side_fallback"] = True
+            diagnostics["fallback_iteration"] = last_feasible_iteration
         diagnostics.update(
             {
                 "theta1": theta1.copy(),
                 "theta2": theta2.copy(),
                 "n_iters": len(loss_history),
-                "stop_reason": "converged" if converged else "max_iters",
+                "stop_reason": stop_reason,
             }
         )
         return self._make_result(
@@ -848,6 +1030,12 @@ class HingeAffineSplitter:
         required_side_points: int,
         diagnostics: dict[str, Any],
     ) -> SplitResult:
+        stop_reason = str(
+            diagnostics.get(
+                "stop_reason",
+                "converged" if converged else "max_iters",
+            )
+        )
         delta = theta1 - theta2
         w = delta[:-1].copy()
         z = -float(delta[-1])
@@ -860,7 +1048,7 @@ class HingeAffineSplitter:
                     **diagnostics,
                     "theta1": theta1.copy(),
                     "theta2": theta2.copy(),
-                    "stop_reason": "converged" if converged else "max_iters",
+                    "stop_reason": stop_reason,
                     "failure_stage": "boundary_normal",
                 },
             )
@@ -882,7 +1070,7 @@ class HingeAffineSplitter:
                     "theta2": theta2.copy(),
                     "n_left": n_left,
                     "n_right": n_right,
-                    "stop_reason": "converged" if converged else "max_iters",
+                    "stop_reason": stop_reason,
                     "failure_stage": "final_partition",
                 },
             )
@@ -924,7 +1112,7 @@ class HingeAffineSplitter:
             n_right=n_right,
             converged=converged,
             n_iters=int(diagnostics["n_iters"]),
-            stop_reason="converged" if converged else "max_iters",
+            stop_reason=stop_reason,
             metadata={
                 **diagnostics,
                 "n_left": n_left,

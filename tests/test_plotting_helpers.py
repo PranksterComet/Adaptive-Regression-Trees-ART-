@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import matplotlib.pyplot as plt
 import numpy as np
 
 from art.tree import LeafNode, RegressionTree, SplitNode
 from examples.plotting_helpers import (
     _leaf_error_style,
     make_tree_leaf_grid,
+    plot_function_contour,
+    plot_tree_leaf_regions,
     predict_tree_leaf_grid,
     resolve_contour_scale,
 )
@@ -85,3 +88,30 @@ def test_tree_leaf_grid_stores_axes_and_predicts_each_leaf_once() -> None:
     np.testing.assert_array_equal(predictions[:, 1:], np.full((3, 2), 2.0))
     assert left_model.batch_sizes == [3]
     assert right_model.batch_sizes == [6]
+
+
+def test_axis_level_helpers_draw_on_supplied_axes() -> None:
+    bounds = np.array([[-1.0, 1.0], [-1.0, 1.0]])
+    tree = RegressionTree(LeafNode(ConstantCountingModel(1.0)))
+    fig, (contour_ax, leaves_ax) = plt.subplots(1, 2)
+
+    filled, scale = plot_function_contour(
+        contour_ax,
+        lambda X: X[:, 0] ** 2 + X[:, 1] ** 2,
+        bounds,
+        resolution=10,
+        levels=5,
+    )
+    leaf_grid = plot_tree_leaf_regions(
+        leaves_ax,
+        tree,
+        bounds,
+        resolution=10,
+    )
+
+    assert filled.axes is contour_ax
+    assert scale == "linear"
+    assert leaf_grid.labels.shape == (10, 10)
+    assert contour_ax.get_aspect() == 1.0
+    assert leaves_ax.get_aspect() == 1.0
+    plt.close(fig)

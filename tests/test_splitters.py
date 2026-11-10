@@ -3,8 +3,24 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from art.models import AffineRidgeModel, augment_features
-from art.splitters import HingeAffineSplitter
+from art.models import AffineRidgeModel, RidgeSolveResult, augment_features
+from art.splitters import HingeAffineSplitter, SoftObliqueSplitter
+
+
+@pytest.mark.parametrize("kind", [HingeAffineSplitter, SoftObliqueSplitter])
+def test_side_threshold_defaults_do_not_depend_on_model_size(kind):
+    s = kind() if kind is HingeAffineSplitter else kind(AffineRidgeModel(), 1.)
+    assert s.min_side_points == 1 and s.min_side_fraction == .05
+    assert s._required_side_points(20) == 1
+    assert s._required_side_points(101) == 6
+    s.min_side_points = 10
+    assert s._required_side_points(101) == 10
+
+
+def test_batched_optimizer_is_not_a_scalar_splitter():
+    s = SoftObliqueSplitter(AffineRidgeModel(), 1., optimizer="cupy_batched_cholesky")
+    with pytest.raises(ValueError, match="requires a BFS builder"):
+        s.split(np.ones((10, 2)), np.ones(10))
 
 
 def hinge_data() -> tuple[np.ndarray, np.ndarray]:
@@ -161,3 +177,56 @@ def test_hinge_result_hard_refits_both_tree_sides() -> None:
     assert result.loss <= parent_loss + 1e-12
     assert result.metadata["hard_left_solve"]["solver_used"] == "qr"
     assert result.metadata["hard_right_solve"]["solver_used"] == "qr"
+
+
+def test_hinge_min_side_fallback_uses_last_feasible_state(monkeypatch) -> None:
+    x = np.linspace(-1.0, 1.0, 40)
+    X = x[:, None]
+    X_aug = augment_features(X)
+    y = x**2
+    theta1 = np.array([0.5, 0.0])
+    theta2 = np.array([-0.5, 0.0])
+    splitter = HingeAffineSplitter(
+        mode="max",
+        ridge=0.0,
+        solver="qr",
+        max_iters=1,
+        min_side_points=4,
+        min_side_fallback=True,
+        n_restarts=1,
+    )
+    original_fit = splitter._fit_theta
+    targets = iter((np.array([1.0, 10.0]), np.array([0.0, 0.0])))
+
+    def force_invalid_update(design, values):
+        try:
+            coefficients = next(targets)
+        except StopIteration:
+            return original_fit(design, values)
+        return RidgeSolveResult(
+            coefficients=coefficients,
+            solver_requested="qr",
+            solver_used="qr",
+            condition_estimator=None,
+            cond_estimate=None,
+            ridge_effective=0.0,
+        )
+
+    monkeypatch.setattr(splitter, "_fit_theta", force_invalid_update)
+    result = splitter._fit_from_initialization(
+        X_aug=X_aug,
+        y=y,
+        theta1=theta1,
+        theta2=theta2,
+        parent_loss=float(np.var(y)),
+        mode="max",
+        required_side_points=4,
+        parent_solve=None,
+    )
+
+    np.testing.assert_allclose(result.w, [1.0])
+    assert result.z == 0.0
+    assert result.stop_reason == "min_side_fallback"
+    assert result.metadata["min_side_fallback"] is True
+    assert result.metadata["fallback_iteration"] == 0
+    assert min(result.n_left, result.n_right) == 20

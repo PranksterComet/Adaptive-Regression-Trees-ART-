@@ -239,7 +239,7 @@ def main() -> None:
     parser.add_argument("--cut-bound-low", type=float, default=0.2)
     parser.add_argument("--cut-bound-high", type=float, default=1.0)
     parser.add_argument("--rotated-width-ratio", type=float, default=0.1)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--output-dir", type=Path, default=Path(__file__).with_name("hit_and_run_autocorr_outputs"))
     args = parser.parse_args()
 

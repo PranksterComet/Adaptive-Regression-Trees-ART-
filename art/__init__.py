@@ -41,15 +41,18 @@ from .objectives import (
 from .optimizers import AdaptiveAlpha, LineSearchResult, armijo_backtracking
 from .presets import (
     DEFAULT_TREE_PRESET,
+    BFS_GPU_TREE_PRESET,
     HingeAffinePreset,
     SamplingPreset,
     SoftObliquePreset,
     TemperaturePreset,
     TreePreset,
-    resolve_min_side_points,
 )
 from .sampling import (
+    BatchedHitAndRunSampler,
     HitAndRunSampler,
+    NumbaBatchedHitAndRunSampler,
+    ParallelNumbaBatchedHitAndRunSampler,
     Sampler,
     UniformBoxSampler,
     autocorrelation_by_lag,
@@ -81,15 +84,19 @@ from .temperature import (
     temperature_grid,
 )
 from .tree import LeafNode, RegressionTree, SplitNode
+from ._cuda_batched_optimizer import BatchedOptimizerWorkspace, optimize_batch
 
 __all__ = [
     "AffineRidgeModel",
     "AdaptiveAlpha",
+    "BatchedHitAndRunSampler",
+    "BatchedOptimizerWorkspace",
     "BoxDomain",
     "ConditionEstimator",
     "DEFAULT_TEMPERATURE_GRID",
     "DEFAULT_AUTO_RCOND_THRESHOLD",
     "DEFAULT_TREE_PRESET",
+    "BFS_GPU_TREE_PRESET",
     "HingeAffineSplitter",
     "HingeAffinePreset",
     "HitAndRunSampler",
@@ -97,6 +104,8 @@ __all__ = [
     "LeafNode",
     "LineSearchResult",
     "MODEL_CONDITION_WARNING_THRESHOLD",
+    "NumbaBatchedHitAndRunSampler",
+    "ParallelNumbaBatchedHitAndRunSampler",
     "PolytopeRegion",
     "PolynomialRidgeModel",
     "PreparedDesign",
@@ -143,7 +152,6 @@ __all__ = [
     "project_unit_w",
     "project_unit_w_gradient",
     "relative_l2_error",
-    "resolve_min_side_points",
     "ridge_solve_diagnostics",
     "sample_covariance_eigendecomposition",
     "sample_uniform_box",
@@ -154,4 +162,5 @@ __all__ = [
     "subsample_points",
     "sum_squared_error",
     "temperature_grid",
+    "optimize_batch",
 ]

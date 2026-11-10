@@ -1,21 +1,35 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import sys
 
 import numpy as np
+import pytest
 
 from art.builder import RegressionTreeBuilder
 from art.domain import BoxDomain
-from art.metrics import mean_squared_error
+from art.metrics import max_pointwise_relative_error, mean_squared_error
 from art.models import (
     AffineRidgeModel,
     PolynomialRidgeModel,
     PreparedFeatureModel,
 )
 from art.sampling import HitAndRunSampler
-from art.splitters import SplitNotFoundError, SplitResult
+from art.splitters import SoftObliqueSplitter, SplitNotFoundError, SplitResult
 from art.temperature import DEFAULT_TEMPERATURE_GRID, TemperatureConfig
 from art.tree import LeafNode, SplitNode
+
+
+@pytest.fixture(params=["dfs", "bfs"], autouse=True)
+def builder_traversal(request, monkeypatch):
+    """Exercise the existing policy tests through both public traversals."""
+    constructor = RegressionTreeBuilder
+
+    def make(*args, **kwargs):
+        kwargs.setdefault("traversal", request.param)
+        return constructor(*args, **kwargs)
+
+    monkeypatch.setattr(sys.modules[__name__], "RegressionTreeBuilder", make)
 
 
 @dataclass
@@ -28,6 +42,7 @@ class FixedAxisSplitter:
     stop_reason: str = "converged"
     metadata: dict[str, object] = field(default_factory=dict)
     random_state: int | np.random.Generator | None = None
+    median: bool = False
 
     def split(
         self,
@@ -39,7 +54,7 @@ class FixedAxisSplitter:
     ) -> SplitResult:
         w = np.zeros(X.shape[1])
         w[0] = 1.0
-        z = 0.0
+        z = float(np.median(X[:, 0])) if self.median else 0.0
         right = (X @ w - z) >= 0.0
         if prepared_design is None:
             left_model = AffineRidgeModel(self.ridge).fit(X[~right], y[~right])
@@ -165,6 +180,52 @@ class TemperatureRetryScriptSplitter(RetryScriptSplitter):
         self.temperature = 0.1
 
 
+class MinSideFallbackScriptSplitter(RetryScriptSplitter):
+    """Expose whether the builder enables fallback on each copied attempt."""
+
+    def __init__(self, state: dict[str, object] | None = None):
+        super().__init__(("min_side_points",), state=state, n_restarts=1)
+        self.min_side_fallback = True
+
+    def __deepcopy__(self, memo):
+        copied = type(self)(self.state)
+        copied.random_state = self.random_state
+        copied.min_side_fallback = self.min_side_fallback
+        return copied
+
+    def split(
+        self,
+        X,
+        y,
+        parent_model=None,
+        parent_loss=None,
+        prepared_design=None,
+    ) -> SplitResult:
+        call = int(self.state["calls"]) + 1
+        self.state["calls"] = call
+        self.state["seeds"].append(self.random_state)
+        if not self.min_side_fallback:
+            raise SplitNotFoundError(
+                "min_side_points",
+                "scripted minimum-side failure",
+                diagnostics={"run": call},
+            )
+
+        result = FixedAxisSplitter().split(
+            X,
+            y,
+            parent_model,
+            parent_loss,
+            prepared_design,
+        )
+        result.metadata = {
+            "run": call,
+            "min_side_fallback": True,
+            "fallback_iteration": 0,
+        }
+        return result
+
+
 class CountingPolynomialModel(PolynomialRidgeModel):
     """Polynomial model exposing accidental raw feature transformations."""
 
@@ -200,6 +261,67 @@ class CountingPolynomialModel(PolynomialRidgeModel):
         return self.clone()
 
 
+class CountingAffineModel(AffineRidgeModel):
+    """Affine model recording the sample count of each unweighted fit."""
+
+    def __init__(self, fit_sizes: list[int], **kwargs):
+        self.fit_sizes = fit_sizes
+        super().__init__(**kwargs)
+
+    def fit(self, X, y):
+        self.fit_sizes.append(np.asarray(X).shape[0])
+        return super().fit(X, y)
+
+    def clone(self):
+        return CountingAffineModel(
+            self.fit_sizes,
+            ridge=self.ridge,
+            solver=self.solver,
+            auto_rcond_threshold=self.auto_rcond_threshold,
+        )
+
+    def __deepcopy__(self, memo):
+        return self.clone()
+
+
+class RecordingSoftSplitter(SoftObliqueSplitter):
+    """Soft-splitter stand-in recording fits completed before splitting."""
+
+    def __init__(self, model_template, state=None, fail=False):
+        super().__init__(
+            model_template=model_template,
+            temperature=0.1,
+            min_side_points=1,
+        )
+        self.state = {} if state is None else state
+        self.fail = fail
+
+    def __deepcopy__(self, memo):
+        copied = type(self)(self.model_template.clone(), self.state, self.fail)
+        copied.random_state = self.random_state
+        return copied
+
+    def split(
+        self,
+        X,
+        y,
+        parent_model=None,
+        parent_loss=None,
+        prepared_design=None,
+        *, hard_refit=True,
+    ) -> SplitResult:
+        self.state["fit_sizes_at_split"] = tuple(parent_model.fit_sizes)
+        if self.fail:
+            raise SplitNotFoundError("invalid_split", "scripted split failure")
+        return FixedAxisSplitter().split(
+            X,
+            y,
+            parent_model,
+            parent_loss,
+            prepared_design,
+        )
+
+
 def piecewise_oracle(x: np.ndarray) -> float:
     if x[0] < 0.0:
         return x[0] - 0.5 * x[1]
@@ -207,6 +329,7 @@ def piecewise_oracle(x: np.ndarray) -> float:
 
 
 def make_retry_builder(splitter, **kwargs) -> RegressionTreeBuilder:
+    kwargs.setdefault("check_split_gain", True)
     model_template = kwargs.pop(
         "model_template",
         AffineRidgeModel(ridge=1e-12),
@@ -264,8 +387,113 @@ def test_root_stops_and_counts_only_sampled_oracle_points() -> None:
     assert result.tree.oracle_queries == 20
     assert "X" not in result.tree.root.metadata
     assert "y" not in result.tree.root.metadata
+    assert "sample_centroid" not in result.tree.root.metadata
     assert result.build_timing is None
     assert result.tree.metadata["build_timing"] is None
+
+
+def test_validation_requires_soft_splitter_and_max_pointwise_metric() -> None:
+    common = {
+        "domain": BoxDomain(np.array([[-1.0, 1.0]])),
+        "oracle": lambda x: x[0],
+        "model_template": AffineRidgeModel(),
+        "error_threshold": 1e-2,
+        "sample_count": 10,
+        "validation_fraction": 0.2,
+    }
+
+    with np.testing.assert_raises_regex(ValueError, "only by SoftObliqueSplitter"):
+        RegressionTreeBuilder(splitter=FixedAxisSplitter(), **common)
+
+    soft_splitter = SoftObliqueSplitter(
+        model_template=common["model_template"].clone(),
+        temperature=0.1,
+        min_side_points=1,
+    )
+    with np.testing.assert_raises_regex(
+        ValueError,
+        "requires max_pointwise_relative_error",
+    ):
+        RegressionTreeBuilder(splitter=soft_splitter, **common)
+
+
+def test_passing_validation_refits_leaf_on_all_samples() -> None:
+    fit_sizes: list[int] = []
+    model = CountingAffineModel(fit_sizes, ridge=0.0, solver="qr")
+    splitter = RecordingSoftSplitter(model.clone())
+    builder = RegressionTreeBuilder(
+        domain=BoxDomain(np.array([[-1.0, 1.0], [-1.0, 1.0]])),
+        oracle=lambda x: 2.0 + x[0] - 0.5 * x[1],
+        model_template=model,
+        splitter=splitter,
+        error_threshold=1e-10,
+        error_metric=max_pointwise_relative_error,
+        sample_count=20,
+        validation_fraction=0.2,
+        random_state=5,
+    )
+
+    root = builder.build().tree.root
+
+    assert isinstance(root, LeafNode)
+    assert root.status == "tolerance_met"
+    assert fit_sizes == [16, 20]
+    assert root.metadata["convergence_fit_samples"] == 16
+    assert root.metadata["convergence_error"] <= builder.error_threshold
+    assert root.metadata["fit_error"] <= builder.error_threshold
+
+
+def test_failed_validation_splits_without_a_full_parent_refit() -> None:
+    fit_sizes: list[int] = []
+    model = CountingAffineModel(fit_sizes, ridge=0.0, solver="qr")
+    state: dict[str, object] = {}
+    splitter = RecordingSoftSplitter(model.clone(), state=state)
+    builder = RegressionTreeBuilder(
+        domain=BoxDomain(np.array([[-1.0, 1.0], [-1.0, 1.0]])),
+        oracle=piecewise_oracle,
+        model_template=model,
+        splitter=splitter,
+        error_threshold=0.0,
+        error_metric=max_pointwise_relative_error,
+        sample_count=20,
+        max_depth=1,
+        validation_fraction=0.2,
+        sampler=HitAndRunSampler(burn_in=0, thinning=1),
+        random_state=5,
+    )
+
+    root = builder.build().tree.root
+
+    assert isinstance(root, SplitNode)
+    assert state["fit_sizes_at_split"] == (16,)
+    assert root.metadata["convergence_fit_samples"] == 16
+
+
+def test_split_failure_refits_leaf_on_all_samples() -> None:
+    fit_sizes: list[int] = []
+    model = CountingAffineModel(fit_sizes, ridge=0.0, solver="qr")
+    state: dict[str, object] = {}
+    splitter = RecordingSoftSplitter(model.clone(), state=state, fail=True)
+    builder = RegressionTreeBuilder(
+        domain=BoxDomain(np.array([[-1.0, 1.0], [-1.0, 1.0]])),
+        oracle=piecewise_oracle,
+        model_template=model,
+        splitter=splitter,
+        error_threshold=0.0,
+        error_metric=max_pointwise_relative_error,
+        sample_count=20,
+        max_depth=1,
+        validation_fraction=0.2,
+        random_state=5,
+    )
+
+    root = builder.build().tree.root
+
+    assert isinstance(root, LeafNode)
+    assert root.status == "invalid_split"
+    assert state["fit_sizes_at_split"] == (16,)
+    assert fit_sizes == [16, 20]
+    assert root.metadata["convergence_fit_samples"] == 16
 
 
 def test_optional_build_timing_profiles_sampling_and_splitter() -> None:
@@ -411,7 +639,7 @@ def test_isotropic_sampling_reports_covariance_floor_saturation() -> None:
         )
 
 
-def test_store_samples_toggle_keeps_copies_on_nodes() -> None:
+def test_storage_toggles_keep_samples_and_leaf_centroid() -> None:
     domain = BoxDomain(np.array([[-1.0, 1.0]]))
     builder = RegressionTreeBuilder(
         domain=domain,
@@ -422,6 +650,7 @@ def test_store_samples_toggle_keeps_copies_on_nodes() -> None:
         sample_count=12,
         max_depth=0,
         store_samples=True,
+        store_leaf_representative=True,
         random_state=4,
     )
 
@@ -431,6 +660,11 @@ def test_store_samples_toggle_keeps_copies_on_nodes() -> None:
     assert root.status == "max_depth"
     assert root.metadata["X"].shape == (12, 1)
     assert root.metadata["y"].shape == (12,)
+    np.testing.assert_allclose(
+        root.metadata["sample_centroid"],
+        np.mean(root.metadata["X"], axis=0),
+    )
+    assert bool(root.region.contains(root.metadata["sample_centroid"])[0])
 
 
 def test_min_side_failure_retries_with_same_samples_and_new_seed() -> None:
@@ -450,6 +684,59 @@ def test_min_side_failure_retries_with_same_samples_and_new_seed() -> None:
     assert np.array_equal(splitter.state["X"][0], splitter.state["X"][1])
     assert np.array_equal(splitter.state["y"][0], splitter.state["y"][1])
     assert splitter.state["seeds"][0] != splitter.state["seeds"][1]
+
+
+@pytest.mark.parametrize("check", [False, True])
+def test_gain_check_toggle_controls_both_thresholds_and_retries(check):
+    splitter = RetryScriptSplitter(("insufficient_split_gain",))
+    result = make_retry_builder(
+        splitter, check_split_gain=check, max_retries_on_failure=1,
+        min_split_gain=1., min_relative_split_gain=1.,
+    ).build()
+    assert result.tree.metadata["check_split_gain"] == check
+    if check:
+        assert isinstance(result.tree.root, LeafNode)
+        assert result.tree.root.status == "insufficient_split_gain"
+        assert result.restarts_on_failure == 1
+    else:
+        assert isinstance(result.tree.root, SplitNode)
+        assert result.tree.root.metadata["split_gain_mse"] == 0.
+        assert result.restarts_on_failure == 0
+
+
+def test_disabled_gain_checks_preserve_numerical_guards():
+    builder = make_retry_builder(FixedAxisSplitter(), check_split_gain=False)
+    result = FixedAxisSplitter().split(
+        np.array([[-1., 0.], [-.5, 1.], [.5, 0.], [1., 1.]]),
+        np.array([0., 1., 2., 3.]), parent_loss=0.,
+    )
+    assert builder._split_rejection_reason(result) is None
+    result.loss = np.nan
+    assert builder._split_rejection_reason(result) == "nonfinite_split"
+    result.loss = 1.
+    result.n_iters, result.stop_reason = 0, "line_search_failed"
+    assert builder._split_rejection_reason(result) == "optimizer_failed_without_progress"
+
+
+def test_min_side_fallback_is_enabled_only_on_final_retry() -> None:
+    splitter = MinSideFallbackScriptSplitter()
+    result = make_retry_builder(
+        splitter,
+        max_retries_on_failure=2,
+    ).build()
+    root = result.tree.root
+
+    assert isinstance(root, SplitNode)
+    assert root.status == "split_with_warnings"
+    assert result.restarts_on_failure == 2
+    assert splitter.state["calls"] == 3
+    assert root.metadata["split_attempt_failure_reasons"] == (
+        "min_side_points",
+        "min_side_points",
+    )
+    assert root.metadata["warnings"] == ("min_side_fallback",)
+    assert root.metadata["splitter_metadata"]["min_side_fallback"] is True
+    assert root.metadata["splitter_metadata"]["fallback_iteration"] == 0
 
 
 def test_insufficient_gain_retries_and_accepts_later_split() -> None:

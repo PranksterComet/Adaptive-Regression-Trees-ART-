@@ -1,4 +1,4 @@
-"""Recursive construction of adaptive regression trees."""
+"""Adaptive regression-tree policies shared by DFS and FIFO construction."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import copy
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from time import perf_counter
-from typing import Callable
+from typing import Callable, Iterator, Literal
 
 import numpy as np
 
@@ -22,6 +22,7 @@ from .models import (
     model_effective_dimension,
     ridge_solve_diagnostics,
 )
+from .objectives import make_cuda_workspace
 from .sampling import (
     HitAndRunSampler,
     Sampler,
@@ -62,9 +63,67 @@ class _NodeSamples:
     sampling_metadata: dict[str, object] = field(default_factory=dict)
 
 
+@dataclass(slots=True)
+class _NodeWork:
+    """One node from inherited samples through a prepared split candidate.
+
+    Children hold only inherited samples until _prepare_node tops them up.
+    parent/side identify the attachment slot. Preparation fills model, parent
+    MSE, metadata and the reusable CPU design; both schedulers use this record.
+    """
+
+    region: PolytopeRegion
+    samples: _NodeSamples
+    depth: int
+    node_id: str
+    parent: SplitNode | None = None
+    side: Literal["left", "right"] | None = None
+    model: RegressionModel | None = None
+    parent_mse: float = 0.0
+    metadata: dict[str, object] = field(default_factory=dict)
+    convergence: dict[str, object] = field(default_factory=dict)
+    prepared: PreparedDesign | None = None
+
+
+@dataclass
+class _SplitState:
+    """Temperature and retry bookkeeping shared by scalar and batch dispatch."""
+
+    temperature: float | None
+    context: dict[str, object]
+    limit: int
+    min_side_fallback: bool
+    retries: int = 0
+    reasons: list[str] = field(default_factory=list)
+
+    @property
+    def fallback(self) -> bool:
+        return self.min_side_fallback and self.retries >= self.limit
+
+    @property
+    def metadata(self) -> dict[str, object]:
+        return {"restarts_on_failure": self.retries,
+                "split_attempt_failure_reasons": tuple(self.reasons)}
+
+    def error(self, exc: SplitNotFoundError) -> SplitNotFoundError:
+        return SplitNotFoundError(
+            exc.reason, str(exc), diagnostics=exc.diagnostics,
+            restarts_on_failure=self.retries, failure_reasons=tuple(self.reasons),
+            context=self.context,
+        )
+
+
 @dataclass
 class RegressionTreeBuilder:
-    """Build a regression tree from an oracle over a convex domain."""
+    """Build a regression tree using DFS (default) or a FIFO BFS scheduler.
+
+    node_batch_size bounds the BFS ready cohort. BFS with a SoftObliqueSplitter
+    using cupy_batched_cholesky runs resident batched optimization; other configurations
+    use scalar splits. batch_reorder removes completed nodes from GPU linear
+    algebra calls. Node-model fits and sampling remain on CPU.
+    Stochastic DFS/BFS runs need not produce identical trees: traversal changes
+    the order in which the builder's random stream is consumed.
+    """
 
     domain: BoxDomain | PolytopeRegion
     oracle: Callable[[np.ndarray], float | np.ndarray]
@@ -86,11 +145,17 @@ class RegressionTreeBuilder:
     min_split_gain: float = 0.0
     min_relative_split_gain: float = 0.0
     max_retries_on_failure: int = 0
+    validation_fraction: float = 0.0
     store_samples: bool = False
+    store_leaf_representative: bool = False
     store_diagnostics: bool = False
     profile_build_timing: bool = False
     oracle_vectorized: bool = False
     random_state: int | np.random.Generator | None = None
+    traversal: Literal["dfs", "bfs"] = "dfs"
+    node_batch_size: int = 20
+    batch_reorder: bool = True
+    check_split_gain: bool = False
 
     oracle_queries: int = field(default=0, init=False)
     restarts_on_failure: int = field(default=0, init=False)
@@ -105,6 +170,19 @@ class RegressionTreeBuilder:
     )
 
     def __post_init__(self) -> None:
+        if self.traversal not in ("dfs", "bfs"):
+            raise ValueError("traversal must be 'dfs' or 'bfs'.")
+        if (not isinstance(self.node_batch_size, (int, np.integer))
+                or isinstance(self.node_batch_size, (bool, np.bool_)) or self.node_batch_size < 1):
+            raise ValueError("node_batch_size must be a positive integer.")
+        self.node_batch_size = int(self.node_batch_size)
+        if not isinstance(self.batch_reorder, (bool, np.bool_)):
+            raise ValueError("batch_reorder must be a boolean.")
+        if not isinstance(self.check_split_gain, (bool, np.bool_)):
+            raise ValueError("check_split_gain must be a boolean.")
+        if (getattr(self.splitter, "optimizer", None) == "cupy_batched_cholesky"
+                and self.traversal != "bfs"):
+            raise ValueError("optimizer='cupy_batched_cholesky' requires traversal='bfs'.")
         if self.error_threshold < 0.0:
             raise ValueError("error_threshold must be nonnegative.")
         if self.max_depth < 0:
@@ -115,6 +193,8 @@ class RegressionTreeBuilder:
             raise ValueError("Split-gain thresholds must be nonnegative.")
         if self.max_retries_on_failure < 0:
             raise ValueError("max_retries_on_failure must be nonnegative.")
+        if not (0.0 <= self.validation_fraction < 1.0):
+            raise ValueError("validation_fraction must satisfy 0 <= fraction < 1.")
         if self.isotropic_sampling and self.isotropic_pilot_multiplier < 2:
             raise ValueError("isotropic_pilot_multiplier must be at least 2.")
         if self.isotropic_sampling and not isinstance(self.sampler, HitAndRunSampler):
@@ -159,6 +239,15 @@ class RegressionTreeBuilder:
             raise TypeError(
                 "SoftObliqueSplitter requires a model with fit_weighted support."
             )
+        if self.validation_fraction > 0.0:
+            if not isinstance(self.splitter, SoftObliqueSplitter):
+                raise ValueError(
+                    "validation_fraction is supported only by SoftObliqueSplitter."
+                )
+            if self._metric_name() != "max_pointwise_relative_error":
+                raise ValueError(
+                    "validation_fraction requires max_pointwise_relative_error."
+                )
         if splitter_uses_temperature and self.temperature_config is None:
             self.temperature_config = TemperatureConfig()
         if not splitter_uses_temperature and self.temperature_config is not None:
@@ -169,6 +258,15 @@ class RegressionTreeBuilder:
             and self._target_samples < 4
         ):
             raise ValueError("Temperature tuning requires at least four node samples.")
+        if self.hard_refits:
+            print("Final hard refits enabled.")
+
+    @property
+    def hard_refits(self) -> bool:
+        """Hard losses are needed for gain checks, restart selection or tuning."""
+        return (not isinstance(self.splitter, SoftObliqueSplitter)
+                or self.check_split_gain or self.splitter.n_restarts != 1
+                or self.temperature_config.strategy not in ("fixed", "splitter"))
 
     @property
     def dimension(self) -> int:
@@ -198,7 +296,20 @@ class RegressionTreeBuilder:
             n_new=X_root.shape[0],
             sampling_metadata=sampling_metadata,
         )
-        root = self._build_node(root_region, root_samples, depth=0, node_id="root")
+        work = _NodeWork(root_region, root_samples, depth=0, node_id="root")
+        if self.traversal == "dfs":
+            root = self._build_node(work)
+        else:
+            from ._batched_builder import build_bfs
+
+            if (isinstance(self.splitter, SoftObliqueSplitter)
+                    and self.splitter.optimizer == "cupy_batched_cholesky"):
+                from ._cuda_batched_builder import BatchedSplitDispatcher
+
+                with BatchedSplitDispatcher(self) as dispatch:
+                    root = build_bfs(self, work, dispatch)
+            else:
+                root = build_bfs(self, work)
         tree = RegressionTree(
             root=root,
             oracle_queries=self.oracle_queries,
@@ -207,8 +318,14 @@ class RegressionTreeBuilder:
                 "error_threshold": self.error_threshold,
                 "effective_dimension": self._effective_dimension,
                 "splitter": type(self.splitter).__name__,
+                "optimizer": getattr(self.splitter, "optimizer", None),
+                "check_split_gain": self.check_split_gain,
+                "hard_refits": self.hard_refits,
+                "traversal": self.traversal,
+                "node_batch_size": self.node_batch_size if self.traversal == "bfs" else 1,
                 "target_samples_per_node": self._target_samples,
                 "restarts_on_failure": self.restarts_on_failure,
+                "validation_fraction": self.validation_fraction,
                 "isotropic_sampling": self.isotropic_sampling,
                 "isotropic_pilot_multiplier": self.isotropic_pilot_multiplier,
                 "temperature_strategy": (
@@ -227,164 +344,160 @@ class RegressionTreeBuilder:
             build_timing=build_timing,
         )
 
-    def _build_node(
-        self,
-        region: PolytopeRegion,
-        samples: _NodeSamples,
-        depth: int,
-        node_id: str,
-    ) -> TreeNode:
-        prepared_design = self._prepare_design(samples.X)
-        model, predictions = self._fit_node_model(
-            samples.X,
-            samples.y,
-            prepared_design,
-        )
-        fit_error = float(self.error_metric(samples.y, predictions))
-        parent_mse = mean_squared_error(samples.y, predictions)
-        base_metadata = self._node_metadata(samples, fit_error, parent_mse, model)
+    def _build_node(self, work: _NodeWork) -> TreeNode:
+        """DFS adapter: retain left-before-right sampling and random-call order."""
+        leaf = self._prepare_node(work)
+        if leaf is not None:
+            return leaf
+        node = self._split_node(work)
+        if isinstance(node, SplitNode):
+            for child in self._children(work, node):
+                setattr(node, child.side, self._build_node(child))
+        return node
 
+    def _prepare_node(self, work: _NodeWork) -> LeafNode | None:
+        """Top up a child, fit its parent model and apply stopping rules once.
+
+        A returned leaf is final. None means work is ready for splitting, with
+        its model/MSE/metadata/design cached. No children are scheduled here.
+        """
+        if work.parent is not None:
+            inherited = work.samples
+            try:
+                work.samples = self._top_up_child(work.region, inherited.X, inherited.y)
+            except (RuntimeError, ValueError) as exc:
+                prepared = self._prepare_design(inherited.X)
+                model, predictions = self._fit_node_model(inherited.X, inherited.y, prepared)
+                metadata = self._node_metadata(
+                    inherited, float(self.error_metric(inherited.y, predictions)),
+                    mean_squared_error(inherited.y, predictions), model,
+                )
+                metadata["sampling_error"] = repr(exc)
+                return self._make_leaf(model, work.region, work.depth, work.node_id,
+                                       "sampling_failed", metadata, inherited)
+
+        samples = work.samples
+        work.prepared = self._prepare_design(samples.X)
+        if self.validation_fraction > 0.0:
+            work.model, predictions, n_fit = self._fit_convergence_model(
+                samples.X, samples.y, work.prepared,
+            )
+            fit_error = float(self.error_metric(samples.y, predictions))
+            work.parent_mse = mean_squared_error(samples.y, predictions)
+            work.convergence = {"convergence_error": fit_error, "convergence_fit_samples": n_fit}
+            work.metadata = {
+                **self._node_metadata(samples, fit_error, work.parent_mse, work.model),
+                **work.convergence,
+            }
+        else:
+            work.model, fit_error, work.parent_mse, work.metadata = self._fit_full_node_model(
+                samples, work.prepared,
+            )
         if fit_error <= self.error_threshold:
-            return self._make_leaf(
-                model, region, depth, node_id, "tolerance_met", base_metadata, samples
-            )
-        if depth >= self.max_depth:
-            return self._make_leaf(
-                model, region, depth, node_id, "max_depth", base_metadata, samples
-            )
+            return self._work_leaf(work, "tolerance_met")
+        if work.depth >= self.max_depth:
+            return self._work_leaf(work, "max_depth")
+        return None
 
+    def _split_node(self, work: _NodeWork) -> TreeNode:
+        """Existing scalar split/retry dispatch shared by both traversals."""
         try:
-            split_result, temperature_metadata, retry_metadata = self._fit_split(
-                samples.X,
-                samples.y,
-                model,
-                parent_mse,
-                depth,
-                prepared_design,
+            result, temperature, retry = self._fit_split(
+                work.samples.X, work.samples.y, work.model, work.parent_mse,
+                work.depth, work.prepared,
             )
         except SplitNotFoundError as exc:
-            warnings = self._combine_warnings(
-                base_metadata.get("warnings", ()),
-                self._diagnostic_warnings(exc.diagnostics),
-            )
-            metadata = {
-                **base_metadata,
-                **exc.context,
-                "split_failure_reason": exc.reason,
-                "restarts_on_failure": exc.restarts_on_failure,
-                "split_attempt_failure_reasons": exc.failure_reasons,
-                "warnings": warnings,
-            }
-            if self.store_diagnostics and exc.diagnostics is not None:
-                metadata["splitter_metadata"] = copy.deepcopy(exc.diagnostics)
-            return self._make_leaf(
-                model, region, depth, node_id, exc.reason, metadata, samples
-            )
+            return self._finish_node(work, exc)
+        return self._finish_node(work, result, {**temperature, **retry})
 
-        rejection_reason = self._split_rejection_reason(split_result)
-        if rejection_reason is not None:
-            warnings = self._combine_warnings(
-                base_metadata.get("warnings", ()),
-                self._split_warnings(split_result),
-            )
-            metadata = {
-                **base_metadata,
-                **self._split_summary(split_result),
-                **temperature_metadata,
-                **retry_metadata,
-                "warnings": warnings,
-            }
-            if self.store_diagnostics:
-                metadata["splitter_metadata"] = copy.deepcopy(split_result.metadata)
-            return self._make_leaf(
-                model, region, depth, node_id, rejection_reason, metadata, samples
-            )
+    def _finish_node(
+        self,
+        work: _NodeWork,
+        result: SplitResult | SplitNotFoundError,
+        context: dict[str, object] | None = None,
+    ) -> TreeNode:
+        """Apply a final split outcome and create a leaf or provisional split.
 
-        right_mask = (samples.X @ split_result.w - split_result.z) >= 0.0
-        left_region, right_region = split_region(
-            region,
-            split_result.w,
-            split_result.z,
-            depth=depth + 1,
-            left_tag=f"{node_id}/L",
-            right_tag=f"{node_id}/R",
+        Both dispatchers call this after resolving their retries.
+        Pending placeholders use hard child models if available, otherwise the
+        fitted parent model. Each child is topped up and fitted when processed.
+        """
+        if isinstance(result, SplitNotFoundError):
+            return self._work_leaf(work, result.reason, error=result)
+        rejection = self._split_rejection_reason(result)
+        if rejection is not None:
+            return self._work_leaf(work, rejection, result=result, context=context)
+
+        regions = split_region(
+            work.region, result.w, result.z, depth=work.depth + 1,
+            left_tag=f"{work.node_id}/L", right_tag=f"{work.node_id}/R",
         )
-        del prepared_design
-        left = self._build_child(
-            left_region,
-            samples.X[~right_mask],
-            samples.y[~right_mask],
-            depth + 1,
-            f"{node_id}/L",
-        )
-        right = self._build_child(
-            right_region,
-            samples.X[right_mask],
-            samples.y[right_mask],
-            depth + 1,
-            f"{node_id}/R",
+        left = LeafNode(result.left_model if result.has_hard_fit else work.model,
+                        regions[0], work.depth + 1,
+                        f"{work.node_id}/L", status="pending")
+        right = LeafNode(result.right_model if result.has_hard_fit else work.model,
+                         regions[1], work.depth + 1,
+                         f"{work.node_id}/R", status="pending")
+        metadata = self._split_metadata(work, result, context)
+        self._store_samples(metadata, work.samples)
+        work.prepared = None  # Release CPU Phi before descending or queueing children.
+        return SplitNode(
+            w=result.w, z=result.z, left=left, right=right, region=work.region,
+            depth=work.depth, node_id=work.node_id,
+            status="split_with_warnings" if metadata["warnings"] else "split", metadata=metadata,
         )
 
-        warnings = self._combine_warnings(
-            base_metadata.get("warnings", ()),
-            self._split_warnings(split_result),
-        )
+    def _split_metadata(self, work, result, context):
         metadata = {
-            **base_metadata,
-            **self._split_summary(split_result),
-            **temperature_metadata,
-            **retry_metadata,
-            "warnings": warnings,
+            **work.metadata, **self._split_summary(result), **(context or {}),
+            "warnings": self._combine_warnings(
+                work.metadata.get("warnings", ()), self._split_warnings(result),
+            ),
         }
         if self.store_diagnostics:
-            metadata["splitter_metadata"] = copy.deepcopy(split_result.metadata)
-        self._store_samples(metadata, samples)
-        return SplitNode(
-            w=split_result.w,
-            z=split_result.z,
-            left=left,
-            right=right,
-            region=region,
-            depth=depth,
-            node_id=node_id,
-            status="split_with_warnings" if warnings else "split",
-            metadata=metadata,
-        )
+            metadata["splitter_metadata"] = copy.deepcopy(result.metadata)
+        return metadata
 
-    def _build_child(
-        self,
-        region: PolytopeRegion,
-        inherited_X: np.ndarray,
-        inherited_y: np.ndarray,
-        depth: int,
-        node_id: str,
-    ) -> TreeNode:
-        try:
-            samples = self._top_up_child(region, inherited_X, inherited_y)
-        except (RuntimeError, ValueError) as exc:
-            prepared_design = self._prepare_design(inherited_X)
-            model, predictions = self._fit_node_model(
-                inherited_X,
-                inherited_y,
-                prepared_design,
+    def _work_leaf(self, work, status, *, result=None, error=None, context=None):
+        """Finalize a leaf, including full-data refitting after validation."""
+        if self.validation_fraction > 0.0:
+            work.model, _, _, work.metadata = self._fit_full_node_model(
+                work.samples, work.prepared, extra_metadata=work.convergence,
             )
-            fallback = _NodeSamples(
-                X=inherited_X,
-                y=inherited_y,
-                n_inherited=inherited_X.shape[0],
-                n_new=0,
-            )
-            metadata = self._node_metadata(
-                fallback,
-                float(self.error_metric(inherited_y, predictions)),
-                mean_squared_error(inherited_y, predictions),
-                model,
-            )
-            metadata["sampling_error"] = repr(exc)
-            return self._make_leaf(
-                model, region, depth, node_id, "sampling_failed", metadata, fallback
-            )
-        return self._build_node(region, samples, depth, node_id)
+        if error is not None:
+            metadata = {
+                **work.metadata, **error.context,
+                "split_failure_reason": error.reason,
+                "restarts_on_failure": error.restarts_on_failure,
+                "split_attempt_failure_reasons": error.failure_reasons,
+                "warnings": self._combine_warnings(
+                    work.metadata.get("warnings", ()), self._diagnostic_warnings(error.diagnostics),
+                ),
+            }
+            if self.store_diagnostics and error.diagnostics is not None:
+                metadata["splitter_metadata"] = copy.deepcopy(error.diagnostics)
+        elif result is not None:
+            metadata = self._split_metadata(work, result, context)
+        else:
+            metadata = work.metadata
+        work.prepared = None
+        return self._make_leaf(work.model, work.region, work.depth, work.node_id,
+                               status, metadata, work.samples)
+
+    def _children(self, work: _NodeWork, node: SplitNode) -> Iterator[_NodeWork]:
+        """Yield inherited-only jobs left then right; never sample/query here.
+
+        Yield lazily so DFS constructs the right inherited subset only after
+        finishing the left subtree. FIFO scheduling consumes both immediately.
+        """
+        samples = work.samples
+        right = (samples.X @ node.w - node.z) >= 0.0
+        for side, mask in (("left", ~right), ("right", right)):
+            child = getattr(node, side)
+            X, y = samples.X[mask], samples.y[mask]
+            inherited = _NodeSamples(X, y, n_inherited=len(X), n_new=0)
+            yield _NodeWork(child.region, inherited, child.depth, child.node_id,
+                            parent=node, side=side)
 
     def _top_up_child(
         self,
@@ -446,55 +559,83 @@ class RegressionTreeBuilder:
         depth: int,
         prepared_design: PreparedDesign | None,
     ) -> tuple[SplitResult, dict[str, object], dict[str, object]]:
-        temperature, temperature_metadata, temperature_tuned = (
-            self._resolve_split_temperature(X, y, depth, prepared_design)
-        )
-        allowed_retries = 0 if temperature_tuned else self.max_retries_on_failure
-        failure_reasons = []
-        retries = 0
+        state = self._split_state(X, y, depth, prepared_design)
+        gram_workspace = None
+        qr_workspace = None
+        cholesky_workspace = None
+        if (
+            isinstance(self.splitter, SoftObliqueSplitter)
+            and self.splitter.optimizer == "hybrid_gram"
+        ):
+            gram_workspace = make_cuda_workspace(
+                self.splitter.model_template, X, y, prepared_design,
+                self.splitter.weight_floor,
+            )
+        if (
+            isinstance(self.splitter, SoftObliqueSplitter)
+            and self.splitter.optimizer == "cupy_qr"
+        ):
+            from ._cuda_optimizer import make_qr_workspace
+
+            qr_workspace = make_qr_workspace(self.splitter, X, y, prepared_design)
+        if (
+            isinstance(self.splitter, SoftObliqueSplitter)
+            and self.splitter.optimizer == "cupy_cholesky"
+        ):
+            from ._cuda_optimizer import make_cholesky_workspace
+
+            cholesky_workspace = make_cholesky_workspace(self.splitter, X, y, prepared_design)
 
         while True:
             try:
+                cuda_kwargs = (
+                    {"gram_workspace": gram_workspace}
+                    if gram_workspace is not None else {}
+                )
+                if qr_workspace is not None:
+                    cuda_kwargs["qr_workspace"] = qr_workspace
+                if cholesky_workspace is not None:
+                    cuda_kwargs["cholesky_workspace"] = cholesky_workspace
                 result = self._run_splitter(
                     X,
                     y,
                     parent_model,
                     parent_mse,
-                    temperature,
+                    state.temperature,
                     prepared_design,
+                    min_side_fallback=state.fallback,
+                    **cuda_kwargs,
                 )
             except SplitNotFoundError as exc:
-                failure_reasons.append(exc.reason)
-                if exc.reason == "min_side_points" and retries < allowed_retries:
-                    retries += 1
-                    self.restarts_on_failure += 1
-                    continue
-                raise SplitNotFoundError(
-                    exc.reason,
-                    str(exc),
-                    diagnostics=exc.diagnostics,
-                    restarts_on_failure=retries,
-                    failure_reasons=tuple(failure_reasons),
-                    context=temperature_metadata,
-                ) from exc
-
-            rejection_reason = self._split_rejection_reason(result)
-            if rejection_reason is not None:
-                failure_reasons.append(rejection_reason)
-            if (
-                rejection_reason
-                in ("insufficient_split_gain", "insufficient_relative_split_gain")
-                and retries < allowed_retries
-            ):
-                retries += 1
-                self.restarts_on_failure += 1
+                result = exc
+            if self._retry_split(state, result):
                 continue
+            if isinstance(result, SplitNotFoundError):
+                raise state.error(result) from result
+            return result, state.context, state.metadata
 
-            retry_metadata = {
-                "restarts_on_failure": retries,
-                "split_attempt_failure_reasons": tuple(failure_reasons),
-            }
-            return result, temperature_metadata, retry_metadata
+    def _split_state(self, X, y, depth, prepared_design) -> _SplitState:
+        temperature, context, tuned = self._resolve_split_temperature(
+            X, y, depth, prepared_design,
+        )
+        return _SplitState(
+            temperature, context, 0 if tuned else self.max_retries_on_failure,
+            bool(getattr(self.splitter, "min_side_fallback", False)),
+        )
+
+    def _retry_split(self, state: _SplitState, result) -> bool:
+        """Retry only min-side exceptions or rejected gains, as in scalar DFS."""
+        failed = isinstance(result, SplitNotFoundError)
+        reason = result.reason if failed else self._split_rejection_reason(result)
+        if reason is not None:
+            state.reasons.append(reason)
+        eligible = (reason == "min_side_points" if failed else
+                    reason in ("insufficient_split_gain", "insufficient_relative_split_gain"))
+        if eligible and state.retries < state.limit:
+            state.retries += 1
+            self.restarts_on_failure += 1
+            return True
+        return False
 
     def _resolve_split_temperature(
         self,
@@ -640,10 +781,22 @@ class RegressionTreeBuilder:
         temperature: float | None,
         prepared_design: PreparedDesign | None,
         random_seed: int | None = None,
+        min_side_fallback: bool | None = None,
+        gram_workspace=None,
+        qr_workspace=None,
+        cholesky_workspace=None,
     ) -> SplitResult:
         node_splitter = copy.deepcopy(self.splitter)
+        if getattr(node_splitter, "optimizer", None) == "cupy_batched_cholesky":
+            # Temperature candidates use the existing scalar Cholesky path.
+            node_splitter.optimizer = "cupy_cholesky"
         if temperature is not None:
             setattr(node_splitter, "temperature", float(temperature))
+        if min_side_fallback is not None and hasattr(
+            node_splitter,
+            "min_side_fallback",
+        ):
+            setattr(node_splitter, "min_side_fallback", min_side_fallback)
         if hasattr(node_splitter, "random_state"):
             setattr(
                 node_splitter,
@@ -656,8 +809,16 @@ class RegressionTreeBuilder:
             "parent_model": parent_model,
             "parent_loss": parent_mse,
         }
+        if isinstance(node_splitter, SoftObliqueSplitter) and not self.hard_refits:
+            split_kwargs["hard_refit"] = False
         if prepared_design is not None:
             split_kwargs["prepared_design"] = prepared_design
+        if gram_workspace is not None:
+            split_kwargs["gram_workspace"] = gram_workspace
+        if qr_workspace is not None:
+            split_kwargs["qr_workspace"] = qr_workspace
+        if cholesky_workspace is not None:
+            split_kwargs["cholesky_workspace"] = cholesky_workspace
         with self._timing_context("splitter"):
             return node_splitter.split(X, y, **split_kwargs)
 
@@ -683,6 +844,58 @@ class RegressionTreeBuilder:
         model.fit_design(prepared_design, y)
         return model, model.predict_design(prepared_design)
 
+    def _fit_convergence_model(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        prepared_design: PreparedDesign | None,
+    ) -> tuple[RegressionModel, np.ndarray, int]:
+        n_validation = max(1, int(round(self.validation_fraction * X.shape[0])))
+        n_validation = min(n_validation, X.shape[0] - 1)
+        fit_indices = self._rng.permutation(X.shape[0])[n_validation:]
+        fit_design = (
+            None if prepared_design is None else prepared_design.subset(fit_indices)
+        )
+        model, _ = self._fit_node_model(
+            X[fit_indices],
+            y[fit_indices],
+            fit_design,
+        )
+        predictions = self._predict_node_model(model, X, prepared_design)
+        return model, predictions, fit_indices.size
+
+    def _fit_full_node_model(
+        self,
+        samples: _NodeSamples,
+        prepared_design: PreparedDesign | None,
+        extra_metadata: dict[str, object] | None = None,
+    ) -> tuple[RegressionModel, float, float, dict[str, object]]:
+        model, predictions = self._fit_node_model(
+            samples.X,
+            samples.y,
+            prepared_design,
+        )
+        fit_error = float(self.error_metric(samples.y, predictions))
+        fit_mse = mean_squared_error(samples.y, predictions)
+        metadata = self._node_metadata(samples, fit_error, fit_mse, model)
+        if extra_metadata is not None:
+            metadata.update(extra_metadata)
+        return model, fit_error, fit_mse, metadata
+
+    @staticmethod
+    def _predict_node_model(
+        model: RegressionModel,
+        X: np.ndarray,
+        prepared_design: PreparedDesign | None,
+    ) -> np.ndarray:
+        if prepared_design is None:
+            return model.predict(X)
+        if not isinstance(model, PreparedFeatureModel):
+            raise TypeError(
+                "A prepared design requires models implementing PreparedFeatureModel."
+            )
+        return model.predict_design(prepared_design)
+
     def _temperature_for_c(
         self,
         X: np.ndarray,
@@ -707,17 +920,16 @@ class RegressionTreeBuilder:
         )
 
     def _split_rejection_reason(self, result: SplitResult) -> str | None:
-        values = (
-            result.loss,
-            result.parent_loss,
-            result.split_gain,
-            result.relative_split_gain,
-        )
+        values = [result.parent_loss, result.z, *result.w]
+        if result.has_hard_fit:
+            values.extend((result.loss, result.split_gain, result.relative_split_gain))
+        elif self.check_split_gain:
+            raise ValueError("Split-gain checks require final hard refits.")
         if not np.all(np.isfinite(values)):
             return "nonfinite_split"
-        if result.split_gain <= self.min_split_gain:
+        if self.check_split_gain and result.split_gain <= self.min_split_gain:
             return "insufficient_split_gain"
-        if result.relative_split_gain <= self.min_relative_split_gain:
+        if self.check_split_gain and result.relative_split_gain <= self.min_relative_split_gain:
             return "insufficient_relative_split_gain"
         numerical_failures = {
             "line_search_failed",
@@ -741,6 +953,8 @@ class RegressionTreeBuilder:
             warnings.append("alpha_max_saturated")
         if bool(result.metadata.get("high_model_conditioning", False)):
             warnings.append("high_model_conditioning")
+        if bool(result.metadata.get("min_side_fallback", False)):
+            warnings.append("min_side_fallback")
         return tuple(dict.fromkeys(warnings))
 
     def _diagnostic_warnings(
@@ -771,6 +985,7 @@ class RegressionTreeBuilder:
 
     def _split_summary(self, result: SplitResult) -> dict[str, object]:
         return {
+            "hard_refit": result.has_hard_fit,
             "split_mse": result.loss,
             "split_gain_mse": result.split_gain,
             "relative_split_gain_mse": result.relative_split_gain,
@@ -833,6 +1048,8 @@ class RegressionTreeBuilder:
         samples: _NodeSamples,
     ) -> LeafNode:
         metadata = dict(metadata)
+        if self.store_leaf_representative:
+            metadata["sample_centroid"] = np.mean(samples.X, axis=0)
         self._store_samples(metadata, samples)
         return LeafNode(
             model=model,

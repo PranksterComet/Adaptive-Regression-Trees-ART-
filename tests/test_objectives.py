@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from time import perf_counter
 
 import numpy as np
 import pytest
@@ -13,7 +14,7 @@ from art.splitters import (
     SplitNotFoundError,
     project_unit_w_gradient,
 )
-from art.timing import BuildTimingProfile
+from art.timing import BuildTimingProfile, SplitterTimingProfile
 
 
 class CountingAffineModel(AffineRidgeModel):
@@ -176,6 +177,49 @@ def test_objective_profiles_only_actual_model_refits() -> None:
 
     assert refit_seconds > 0.0
     assert profile.optimizer_model_refit_seconds == refit_seconds
+
+
+def test_splitter_detailed_timing_counts_single_split_operations() -> None:
+    X, y = piecewise_affine_data()
+    profile = SplitterTimingProfile()
+    splitter = SoftObliqueSplitter(
+        model_template=AffineRidgeModel(),
+        temperature=0.15,
+        max_iters=1,
+        grad_atol=0.0,
+        grad_rtol=0.0,
+        min_side_points=2,
+        n_restarts=1,
+        alpha0=0.1,
+        adaptive_alpha=False,
+        max_backtracks=10,
+        refit_during_line_search=False,
+        random_state=7,
+        split_timing_profile=profile,
+    )
+
+    start = perf_counter()
+    result = splitter.split(X, y)
+    summary = profile.summary(perf_counter() - start)
+
+    assert profile.least_squares_count == result.n_iters + 2
+    assert profile.gradient_count == result.n_iters + 1
+    assert profile.line_search_candidate_count == sum(
+        value + 1 for value in result.metadata["backtrack_history"]
+    )
+    assert profile.backtracking_count == result.n_iters
+    assert profile.sigmoid_count == (
+        result.n_iters + 1 + profile.line_search_candidate_count
+    )
+    assert all(
+        float(summary[phase + "_seconds"]) >= 0.0
+        for phase in (
+            "least_squares",
+            "backtracking",
+            "gradient",
+            "sigmoid",
+        )
+    )
 
 
 def make_counting_splitter(
@@ -388,6 +432,65 @@ def test_accepted_step_below_alpha_min_does_not_stop(monkeypatch) -> None:
     assert result.stop_reason == "max_iters"
     assert result.metadata["step_size_history"] == [accepted_step, accepted_step]
     assert result.metadata["alpha_min_saturated"] is True
+
+
+@pytest.mark.parametrize("min_side_fallback", (False, True))
+def test_soft_splitter_min_side_fallback_uses_last_feasible_iteration(
+    monkeypatch,
+    min_side_fallback: bool,
+) -> None:
+    X, y = piecewise_affine_data()
+    initial_theta = np.array([1.0, 0.0, 0.0])
+    feasible_theta = np.array([1.0, 0.0, 0.2])
+    candidate_thetas = iter(
+        (feasible_theta, np.array([1.0, 0.0, -10.0]))
+    )
+
+    def accept_scripted_step(value_fn, **kwargs) -> LineSearchResult:
+        del kwargs
+        theta = next(candidate_thetas)
+        return LineSearchResult(
+            theta=theta.copy(),
+            value=value_fn(theta),
+            step_size=1.0,
+            success=True,
+            n_backtracks=0,
+        )
+
+    splitter = SoftObliqueSplitter(
+        model_template=AffineRidgeModel(),
+        temperature=0.15,
+        max_iters=2,
+        grad_atol=0.0,
+        grad_rtol=0.0,
+        min_side_points=2,
+        min_side_fallback=min_side_fallback,
+        n_restarts=1,
+        random_state=7,
+    )
+    monkeypatch.setattr(
+        splitter,
+        "_initialize_theta",
+        lambda X, rng: initial_theta.copy(),
+    )
+    monkeypatch.setattr("art.splitters.armijo_backtracking", accept_scripted_step)
+
+    if not min_side_fallback:
+        with pytest.raises(SplitNotFoundError) as exc_info:
+            splitter.split(X, y)
+        assert exc_info.value.reason == "min_side_points"
+        assert "min_side_fallback" not in exc_info.value.diagnostics
+        return
+
+    result = splitter.split(X, y)
+
+    np.testing.assert_allclose(result.w, feasible_theta[:-1])
+    assert result.z == feasible_theta[-1]
+    assert result.n_iters == 2
+    assert result.stop_reason == "max_iters"
+    assert result.metadata["min_side_fallback"] is True
+    assert result.metadata["fallback_iteration"] == 1
+    assert min(result.n_left, result.n_right) >= splitter.min_side_points
 
 
 def test_internal_restarts_return_best_valid_result(monkeypatch) -> None:

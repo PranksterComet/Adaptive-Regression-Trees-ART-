@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from .models import (
     DEFAULT_AUTO_RCOND_THRESHOLD,
-    RegressionModel,
     RidgeSolver,
-    model_effective_dimension,
 )
+from .splitters import Optimizer
 from .temperature import (
     DEFAULT_TEMPERATURE_GRID,
     TemperatureMode,
@@ -20,6 +19,7 @@ from .temperature import (
 
 NearestNeighborSelection = Literal["auto", "kdtree", "bruteforce"]
 TreeSplitterName = Literal["soft_oblique", "hrt"]
+TreeSamplerName = Literal["hit_and_run", "parallel_numba"]
 
 
 @dataclass(frozen=True)
@@ -30,8 +30,8 @@ class SoftObliquePreset:
     max_iters: int = 200
     grad_atol: float = 1e-8
     grad_rtol: float = 1e-5
-    min_side_points: int | None = None
-    min_side_fraction: float = 0.0
+    min_side_points: int = 1
+    min_side_fraction: float = 0.05
     n_restarts: int = 1
     alpha0: float = 1.0
     rho: float = 0.5
@@ -46,6 +46,10 @@ class SoftObliquePreset:
     max_line_search_failures: int = 5
     weight_floor: float = 1e-12
     refit_during_line_search: bool = False
+    optimizer: Optimizer = "cpu"
+    backtrack_batch_size: int = 8
+    Xw_refresh: int = 32
+    qr_parallel: bool = True
 
 
 @dataclass(frozen=True)
@@ -62,11 +66,15 @@ class HingeAffinePreset:
 class SamplingPreset:
     """Default hit-and-run settings for tree nodes."""
 
+    sampler_name: TreeSamplerName = "hit_and_run"
     burn_in: int = 0
     thinning: int = 20
+    n_chains: int = 50
+    threads: int = 10
+    parallel_random: bool = True
     feasibility_tol: float = 1e-10
     max_feasible_tries: int = 20_000
-    isotropic_sampling: bool = True
+    isotropic_sampling: bool = False
     isotropic_pilot_multiplier: int = 50
     direction_eigenvalue_floor: float = 1e-2
 
@@ -92,6 +100,9 @@ class TreePreset:
     leaf_degree: int = 1
     leaf_include_bias: bool = True
     splitter_name: TreeSplitterName = "soft_oblique"
+    traversal: Literal["dfs", "bfs"] = "dfs"
+    node_batch_size: int = 20
+    batch_reorder: bool = True
     error_metric: str = "max_pointwise_relative"
     error_tolerance: float = 1e-2
     relative_error_floor: float = 1e-12
@@ -101,11 +112,15 @@ class TreePreset:
     ridge: float = 0.0
     ridge_solver: RidgeSolver = "auto"
     auto_rcond_threshold: float = DEFAULT_AUTO_RCOND_THRESHOLD
+    check_split_gain: bool = False
     min_split_gain: float = 0.0
-    min_relative_split_gain: float = 1e-3
+    min_relative_split_gain: float = 0.0
     max_retries_on_failure: int = 3
+    min_side_fallback: bool = True
+    validation_fraction: float = 0.0
     exact_box_root: bool = True
     store_samples: bool = False
+    store_leaf_representative: bool = False
     store_diagnostics: bool = True
     profile_build_timing: bool = False
     oracle_vectorized: bool = True
@@ -116,18 +131,7 @@ class TreePreset:
 
 
 DEFAULT_TREE_PRESET = TreePreset()
-
-
-def resolve_min_side_points(
-    configured_value: int | None,
-    model: RegressionModel,
-    input_dimension: int,
-) -> tuple[int, str]:
-    """Resolve an explicit minimum or use the model's effective dimension."""
-
-    if configured_value is None:
-        return model_effective_dimension(model, input_dimension), "effective_dimension"
-    value = int(configured_value)
-    if value < 1:
-        raise ValueError("min_side_points must be at least 1.")
-    return value, "explicit"
+BFS_GPU_TREE_PRESET = replace(
+    DEFAULT_TREE_PRESET, traversal="bfs",
+    splitter=replace(DEFAULT_TREE_PRESET.splitter, optimizer="cupy_batched_cholesky"),
+)

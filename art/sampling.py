@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Literal, Protocol, Sequence, runtime_checkable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from threading import Lock
+from time import perf_counter
+from typing import ClassVar, Literal, Protocol, Sequence, runtime_checkable
 
 import numpy as np
 
@@ -15,10 +18,36 @@ ThinningCandidateMode = Literal["linear", "powers_of_two"]
 ProbeMode = Literal["coordinates", "random", "both"]
 
 
+_RANDOM_EXECUTORS: dict[int, ThreadPoolExecutor] = {}
+_RANDOM_EXECUTORS_LOCK = Lock()
+
+
 def as_rng(random_state: RandomState = None) -> np.random.Generator:
     if isinstance(random_state, np.random.Generator):
         return random_state
     return np.random.default_rng(random_state)
+
+
+def _random_executor(n_threads: int) -> ThreadPoolExecutor:
+    with _RANDOM_EXECUTORS_LOCK:
+        executor = _RANDOM_EXECUTORS.get(n_threads)
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=n_threads,
+                thread_name_prefix="art-rng",
+            )
+            _RANDOM_EXECUTORS[n_threads] = executor
+        return executor
+
+
+def _fill_numpy_random_block(
+    directions: np.ndarray,
+    uniforms: np.ndarray,
+    seed: int,
+) -> None:
+    rng = np.random.Generator(np.random.SFC64(seed))
+    rng.standard_normal(out=directions)
+    rng.random(out=uniforms)
 
 
 @runtime_checkable
@@ -516,21 +545,481 @@ class HitAndRunSampler:
     ) -> tuple[float, float]:
         Ax = region.A @ x
         Ad = region.A @ direction
-        t_low = -np.inf
-        t_high = np.inf
+        slack = region.b - Ax
+        positive = Ad > 1e-14
+        negative = Ad < -1e-14
+        parallel = ~(positive | negative)
 
-        for a_dot_d, a_dot_x, bound in zip(Ad, Ax, region.b):
-            if abs(a_dot_d) <= 1e-14:
-                if a_dot_x > bound + self.feasibility_tol:
-                    raise RuntimeError("Current point is infeasible.")
-                continue
+        if np.any(parallel & (slack < -self.feasibility_tol)):
+            raise RuntimeError("Current point is infeasible.")
 
-            t = (bound - a_dot_x) / a_dot_d
-            if a_dot_d > 0:
-                t_high = min(t_high, t)
-            else:
-                t_low = max(t_low, t)
+        ratios = np.empty_like(Ad)
+        nonparallel = positive | negative
+        np.divide(slack, Ad, out=ratios, where=nonparallel)
+        t_low = np.maximum.reduce(ratios, where=negative, initial=-np.inf)
+        t_high = np.minimum.reduce(ratios, where=positive, initial=np.inf)
 
         if t_low > t_high:
             raise RuntimeError("Empty hit-and-run step interval.")
         return float(t_low), float(t_high)
+
+
+@dataclass
+class _BatchedHitAndRunWorkspace:
+    """Preallocated arrays reused by batched hit-and-run transitions."""
+
+    directions_times_constraints: np.ndarray | None
+    ratios: np.ndarray
+    mask: np.ndarray
+    t_low: np.ndarray
+    t_high: np.ndarray
+    step_sizes: np.ndarray
+
+    @classmethod
+    def allocate(
+        cls,
+        n_chains: int,
+        n_constraints: int,
+        *,
+        allocate_constraint_products: bool = True,
+    ) -> _BatchedHitAndRunWorkspace:
+        constraint_shape = (n_chains, n_constraints)
+        return cls(
+            directions_times_constraints=(
+                np.empty(constraint_shape)
+                if allocate_constraint_products
+                else None
+            ),
+            ratios=np.empty(constraint_shape),
+            mask=np.empty(constraint_shape, dtype=bool),
+            t_low=np.empty(n_chains),
+            t_high=np.empty(n_chains),
+            step_sizes=np.empty(n_chains),
+        )
+
+
+@dataclass
+class BatchedHitAndRunSampler(HitAndRunSampler):
+    """Vectorized hit-and-run using several chains and incremental slacks."""
+
+    n_chains: int = 20
+    precompute_ad: bool = False
+    profile_timing: bool = False
+    last_phase_timings: dict[str, float] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _compiled_kernel: ClassVar[bool] = False
+    _parallel_kernel: ClassVar[bool] = False
+    _chain_major: ClassVar[bool] = False
+
+    def sample(
+        self,
+        region: PolytopeRegion,
+        n: int,
+        random_state: RandomState = None,
+        x0: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Draw samples, treating a two-dimensional ``x0`` as a seed pool."""
+
+        if n < 0:
+            raise ValueError("n must be nonnegative.")
+        if self.burn_in < 0:
+            raise ValueError("burn_in must be nonnegative.")
+        if self.thinning < 0:
+            raise ValueError("thinning must be nonnegative.")
+        if self.n_chains < 1:
+            raise ValueError("n_chains must be at least 1.")
+
+        self.last_phase_timings = {}
+        phase_timings = self.last_phase_timings if self.profile_timing else None
+        n = int(n)
+        dimension = region.dimension
+        if n == 0:
+            return np.empty((0, dimension), dtype=float)
+
+        rng = as_rng(random_state)
+        n_chains = min(self.n_chains, n)
+        points = self._initial_points(region, n_chains, rng, x0)
+        constraints_transposed = np.ascontiguousarray(region.A.T)
+        phase_start = perf_counter() if phase_timings is not None else 0.0
+        slack = region.b[None, :] - points @ constraints_transposed
+        if phase_timings is not None:
+            phase_timings["slack_matmul_seconds"] = perf_counter() - phase_start
+        if not self._compiled_kernel:
+            workspace = _BatchedHitAndRunWorkspace.allocate(
+                n_chains,
+                region.A.shape[0],
+                allocate_constraint_products=not self.precompute_ad,
+            )
+
+        stride = max(1, self.thinning)
+        full_rounds, remainder = divmod(n, n_chains)
+        n_full_steps = self.burn_in + full_rounds * stride
+        if self._chain_major:
+            full_direction_shape = (n_chains, n_full_steps, dimension)
+            full_uniform_shape = (n_chains, n_full_steps)
+        else:
+            full_direction_shape = (n_full_steps, n_chains, dimension)
+            full_uniform_shape = (n_full_steps, n_chains)
+        phase_start = perf_counter() if phase_timings is not None else 0.0
+        directions, uniforms = self._draw_random_arrays(
+            rng,
+            full_direction_shape,
+            full_uniform_shape,
+        )
+        if phase_timings is not None:
+            phase_timings["random_generation_seconds"] = (
+                perf_counter() - phase_start
+            )
+        directions = self._shape_directions(directions, dimension)
+        if self.precompute_ad:
+            phase_start = perf_counter() if phase_timings is not None else 0.0
+            constraint_products = self._precompute_constraint_products(
+                directions,
+                constraints_transposed,
+            )
+            if phase_timings is not None:
+                phase_timings["constraint_product_matmul_seconds"] = (
+                    perf_counter() - phase_start
+                )
+        else:
+            constraint_products = None
+        if remainder:
+            if self._chain_major:
+                tail_direction_shape = (remainder, stride, dimension)
+                tail_uniform_shape = (remainder, stride)
+            else:
+                tail_direction_shape = (stride, remainder, dimension)
+                tail_uniform_shape = (stride, remainder)
+            phase_start = perf_counter() if phase_timings is not None else 0.0
+            tail_directions, tail_uniforms = self._draw_random_arrays(
+                rng,
+                tail_direction_shape,
+                tail_uniform_shape,
+            )
+            if phase_timings is not None:
+                phase_timings["random_generation_seconds"] += (
+                    perf_counter() - phase_start
+                )
+            tail_directions = self._shape_directions(tail_directions, dimension)
+            if self.precompute_ad:
+                phase_start = perf_counter() if phase_timings is not None else 0.0
+                tail_constraint_products = self._precompute_constraint_products(
+                    tail_directions,
+                    constraints_transposed,
+                )
+                if phase_timings is not None:
+                    phase_timings["constraint_product_matmul_seconds"] += (
+                        perf_counter() - phase_start
+                    )
+            else:
+                tail_constraint_products = None
+            if not self._compiled_kernel:
+                tail_workspace = _BatchedHitAndRunWorkspace.allocate(
+                    remainder,
+                    region.A.shape[0],
+                    allocate_constraint_products=not self.precompute_ad,
+                )
+
+        samples = np.empty((n, dimension), dtype=float)
+        full_output_size = full_rounds * n_chains
+        transition_start = perf_counter() if phase_timings is not None else 0.0
+        if self._compiled_kernel:
+            if self._parallel_kernel:
+                from ._numba_sampling import (
+                    sample_precomputed_chains_parallel as compiled_sampler,
+                )
+            else:
+                from ._numba_sampling import (
+                    sample_precomputed_chains as compiled_sampler,
+                )
+
+            compiled_sampler(
+                points,
+                slack,
+                directions,
+                constraint_products,
+                uniforms,
+                self.burn_in,
+                stride,
+                samples[:full_output_size],
+            )
+            if remainder:
+                compiled_sampler(
+                    points[:remainder],
+                    slack[:remainder],
+                    tail_directions,
+                    tail_constraint_products,
+                    tail_uniforms,
+                    0,
+                    stride,
+                    samples[full_output_size:],
+                )
+            if phase_timings is not None:
+                phase_timings["transitions_seconds"] = (
+                    perf_counter() - transition_start
+                )
+            return samples
+
+        direction_index = 0
+        for _ in range(self.burn_in):
+            self._advance_batch(
+                constraints_transposed,
+                points,
+                slack,
+                directions[direction_index],
+                uniforms[direction_index],
+                workspace,
+                None if constraint_products is None else constraint_products[direction_index],
+            )
+            direction_index += 1
+
+        output_index = 0
+        for _ in range(full_rounds):
+            for _ in range(stride):
+                self._advance_batch(
+                    constraints_transposed,
+                    points,
+                    slack,
+                    directions[direction_index],
+                    uniforms[direction_index],
+                    workspace,
+                    None if constraint_products is None else constraint_products[direction_index],
+                )
+                direction_index += 1
+            samples[output_index : output_index + n_chains] = points
+            output_index += n_chains
+
+        if remainder:
+            for step in range(stride):
+                self._advance_batch(
+                    constraints_transposed,
+                    points[:remainder],
+                    slack[:remainder],
+                    tail_directions[step],
+                    tail_uniforms[step],
+                    tail_workspace,
+                    None
+                    if tail_constraint_products is None
+                    else tail_constraint_products[step],
+                )
+            samples[output_index:] = points[:remainder]
+
+        if phase_timings is not None:
+            phase_timings["transitions_seconds"] = perf_counter() - transition_start
+        return samples
+
+    def _draw_random_arrays(
+        self,
+        rng: np.random.Generator,
+        direction_shape: tuple[int, int, int],
+        uniform_shape: tuple[int, int],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        return (
+            rng.normal(size=direction_shape),
+            rng.random(size=uniform_shape),
+        )
+
+    def _initial_points(
+        self,
+        region: PolytopeRegion,
+        n_chains: int,
+        rng: np.random.Generator,
+        x0: np.ndarray | None,
+    ) -> np.ndarray:
+        if x0 is None:
+            seed = find_feasible_point(
+                region,
+                bounds=self.bounds,
+                max_tries=self.max_feasible_tries,
+                random_state=rng,
+                tol=self.feasibility_tol,
+            )
+            return np.repeat(seed[None, :], n_chains, axis=0)
+
+        candidates = np.asarray(x0, dtype=float)
+        if candidates.ndim == 1:
+            candidates = candidates[None, :]
+        if candidates.ndim != 2 or candidates.shape[1] != region.dimension:
+            raise ValueError(
+                "x0 must have shape "
+                f"({region.dimension},) or (n_points, {region.dimension}), "
+                f"got {candidates.shape}."
+            )
+        if candidates.shape[0] == 0:
+            raise ValueError("x0 must contain at least one starting point.")
+        if not np.all(region.contains(candidates, tol=self.feasibility_tol)):
+            raise ValueError("All x0 candidates must be feasible for the region.")
+
+        indices = rng.choice(
+            candidates.shape[0],
+            size=n_chains,
+            replace=candidates.shape[0] < n_chains,
+        )
+        return candidates[indices].copy()
+
+    def _shape_directions(
+        self,
+        directions: np.ndarray,
+        dimension: int,
+    ) -> np.ndarray:
+        eigenvectors, sqrt_eigenvalues = self._direction_spectrum(dimension)
+        if eigenvectors is None:
+            return directions
+        directions *= sqrt_eigenvalues
+        return directions @ eigenvectors.T
+
+    @staticmethod
+    def _precompute_constraint_products(
+        directions: np.ndarray,
+        constraints_transposed: np.ndarray,
+    ) -> np.ndarray:
+        dimension = directions.shape[-1]
+        flat_products = directions.reshape(-1, dimension) @ constraints_transposed
+        return flat_products.reshape(
+            directions.shape[:-1] + (constraints_transposed.shape[1],)
+        )
+
+    @staticmethod
+    def _advance_batch(
+        constraints_transposed: np.ndarray,
+        points: np.ndarray,
+        slack: np.ndarray,
+        directions: np.ndarray,
+        uniforms: np.ndarray,
+        workspace: _BatchedHitAndRunWorkspace,
+        precomputed_constraint_products: np.ndarray | None,
+    ) -> None:
+        if precomputed_constraint_products is None:
+            directions_times_constraints = workspace.directions_times_constraints
+            if directions_times_constraints is None:
+                raise RuntimeError("Missing constraint-product workspace.")
+            np.matmul(
+                directions,
+                constraints_transposed,
+                out=directions_times_constraints,
+            )
+        else:
+            directions_times_constraints = precomputed_constraint_products
+        np.not_equal(
+            directions_times_constraints,
+            0.0,
+            out=workspace.mask,
+        )
+        np.divide(
+            slack,
+            directions_times_constraints,
+            out=workspace.ratios,
+            where=workspace.mask,
+        )
+        np.less(
+            directions_times_constraints,
+            0.0,
+            out=workspace.mask,
+        )
+        np.max(
+            workspace.ratios,
+            axis=1,
+            where=workspace.mask,
+            initial=-np.inf,
+            out=workspace.t_low,
+        )
+        np.greater(
+            directions_times_constraints,
+            0.0,
+            out=workspace.mask,
+        )
+        np.min(
+            workspace.ratios,
+            axis=1,
+            where=workspace.mask,
+            initial=np.inf,
+            out=workspace.t_high,
+        )
+
+        np.subtract(
+            workspace.t_high,
+            workspace.t_low,
+            out=workspace.step_sizes,
+        )
+        np.multiply(workspace.step_sizes, uniforms, out=workspace.step_sizes)
+        np.add(workspace.step_sizes, workspace.t_low, out=workspace.step_sizes)
+
+        np.multiply(
+            directions,
+            workspace.step_sizes[:, None],
+            out=directions,
+        )
+        np.add(points, directions, out=points)
+        np.multiply(
+            directions_times_constraints,
+            workspace.step_sizes[:, None],
+            out=directions_times_constraints,
+        )
+        np.subtract(slack, directions_times_constraints, out=slack)
+
+
+@dataclass
+class NumbaBatchedHitAndRunSampler(BatchedHitAndRunSampler):
+    """Batched hit-and-run with one-shot ``AD`` and compiled transitions."""
+
+    precompute_ad: bool = field(default=True, init=False)
+    _compiled_kernel: ClassVar[bool] = True
+
+
+@dataclass
+class ParallelNumbaBatchedHitAndRunSampler(NumbaBatchedHitAndRunSampler):
+    """Chain-major Numba sampler that advances chains across CPU threads."""
+
+    n_chains: int = 50
+    parallel_random: bool = True
+    random_threads: int = 10
+    _parallel_kernel: ClassVar[bool] = True
+    _chain_major: ClassVar[bool] = True
+
+    def _draw_random_arrays(
+        self,
+        rng: np.random.Generator,
+        direction_shape: tuple[int, int, int],
+        uniform_shape: tuple[int, int],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if not self.parallel_random:
+            return super()._draw_random_arrays(
+                rng,
+                direction_shape,
+                uniform_shape,
+            )
+        if self.random_threads < 1:
+            raise ValueError("random_threads must be at least 1.")
+
+        n_chains = direction_shape[0]
+        n_workers = min(self.random_threads, n_chains)
+        directions = np.empty(direction_shape, dtype=float)
+        uniforms = np.empty(uniform_shape, dtype=float)
+        seeds = rng.integers(
+            0,
+            np.iinfo(np.uint64).max,
+            size=n_workers,
+            dtype=np.uint64,
+        )
+        futures = []
+        executor = _random_executor(self.random_threads)
+        block_size, extra = divmod(n_chains, n_workers)
+        start = 0
+        for worker, seed in enumerate(seeds):
+            stop = start + block_size + (worker < extra)
+            futures.append(
+                executor.submit(
+                    _fill_numpy_random_block,
+                    directions[start:stop],
+                    uniforms[start:stop],
+                    int(seed),
+                )
+            )
+            start = stop
+        for future in futures:
+            future.result()
+        return directions, uniforms

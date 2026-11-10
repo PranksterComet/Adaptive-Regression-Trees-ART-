@@ -8,6 +8,7 @@ from typing import Callable, Literal
 
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm, Normalize, SymLogNorm
+from matplotlib.contour import QuadContourSet
 import numpy as np
 
 from art.tree import LeafNode, RegressionTree, TreeNode
@@ -101,18 +102,17 @@ def resolve_contour_scale(
     return "log" if np.all(values >= 0.0) else "symlog"
 
 
-def save_function_contour(
+def plot_function_contour(
+    ax: plt.Axes,
     function: Callable[[np.ndarray], np.ndarray],
     bounds: np.ndarray,
-    title: str,
-    out_path: Path,
     resolution: int = 300,
     levels: int = 30,
     scale: ContourScale = "linear",
     dynamic_range_threshold: float = 1e3,
     symlog_linthresh: float | None = None,
-) -> Literal["linear", "log", "symlog"]:
-    """Evaluate a vectorized 2D function and save its filled contour plot."""
+) -> tuple[QuadContourSet, Literal["linear", "log", "symlog"]]:
+    """Draw a vectorized 2D function contour on a caller-owned axis."""
 
     X1, X2, points = make_2d_grid(bounds, resolution)
     values = np.asarray(function(points), dtype=float).reshape(X1.shape)
@@ -128,7 +128,6 @@ def save_function_contour(
         symlog_linthresh=symlog_linthresh,
     )
 
-    fig, ax = plt.subplots(figsize=(7, 6))
     filled = ax.contourf(
         X1,
         X2,
@@ -146,12 +145,42 @@ def save_function_contour(
         linewidths=0.25,
         alpha=0.35,
     )
+    ax.set_xlim(bounds[0])
+    ax.set_ylim(bounds[1])
+    ax.set_aspect("equal", adjustable="box")
+    return filled, resolved_scale
+
+
+def save_function_contour(
+    function: Callable[[np.ndarray], np.ndarray],
+    bounds: np.ndarray,
+    title: str,
+    out_path: Path,
+    resolution: int = 300,
+    levels: int = 30,
+    scale: ContourScale = "linear",
+    dynamic_range_threshold: float = 1e3,
+    symlog_linthresh: float | None = None,
+) -> Literal["linear", "log", "symlog"]:
+    """Evaluate a vectorized 2D function and save its filled contour plot."""
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    filled, resolved_scale = plot_function_contour(
+        ax,
+        function,
+        bounds,
+        resolution=resolution,
+        levels=levels,
+        scale=scale,
+        dynamic_range_threshold=dynamic_range_threshold,
+        symlog_linthresh=symlog_linthresh,
+    )
     colorbar = fig.colorbar(filled, ax=ax, label="f(x)")
     if resolved_scale == "log":
+        norm = filled.norm
         log_ticks = np.geomspace(norm.vmin, norm.vmax, min(7, levels + 1))
         colorbar.set_ticks(log_ticks, labels=[f"{tick:.1e}" for tick in log_ticks])
     ax.set(xlabel="x1", ylabel="x2", title=title)
-    ax.set_aspect("equal", adjustable="box")
     fig.tight_layout()
     fig.savefig(out_path, dpi=200)
     plt.close(fig)
@@ -281,16 +310,15 @@ def save_tree_contour(
     return resolved_scale
 
 
-def save_tree_leaf_regions(
+def plot_tree_leaf_regions(
+    ax: plt.Axes,
     tree: RegressionTree,
     bounds: np.ndarray,
-    title: str,
-    out_path: Path,
     resolution: int = 300,
     label_leaves: bool = False,
     leaf_grid: TreeLeafGrid | None = None,
-) -> None:
-    """Save sampled leaf regions with different colors for adjacent leaves."""
+) -> TreeLeafGrid:
+    """Draw adjacency-colored leaf regions on a caller-owned axis."""
 
     leaf_grid = (
         make_tree_leaf_grid(tree, bounds, resolution)
@@ -303,7 +331,6 @@ def save_tree_leaf_regions(
     ).reshape(leaf_grid.labels.shape)
     n_colors = max(colors.values()) + 1
 
-    fig, ax = plt.subplots(figsize=(7, 6))
     ax.pcolormesh(
         leaf_grid.x1,
         leaf_grid.x2,
@@ -318,6 +345,32 @@ def save_tree_leaf_regions(
         leaf_grid,
         bounds,
         label_leaves=label_leaves,
+    )
+    ax.set_xlim(bounds[0])
+    ax.set_ylim(bounds[1])
+    ax.set_aspect("equal", adjustable="box")
+    return leaf_grid
+
+
+def save_tree_leaf_regions(
+    tree: RegressionTree,
+    bounds: np.ndarray,
+    title: str,
+    out_path: Path,
+    resolution: int = 300,
+    label_leaves: bool = False,
+    leaf_grid: TreeLeafGrid | None = None,
+) -> None:
+    """Save sampled leaf regions with different colors for adjacent leaves."""
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    plot_tree_leaf_regions(
+        ax,
+        tree,
+        bounds,
+        resolution=resolution,
+        label_leaves=label_leaves,
+        leaf_grid=leaf_grid,
     )
     _finish_tree_plot(ax, bounds, title, out_path)
 

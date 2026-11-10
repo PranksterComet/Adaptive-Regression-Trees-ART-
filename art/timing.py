@@ -9,6 +9,12 @@ from typing import Iterator, Literal
 
 
 BuildTimingCategory = Literal["sampling", "splitter", "model_refit"]
+SplitterTimingCategory = Literal[
+    "least_squares",
+    "backtracking",
+    "gradient",
+    "sigmoid",
+]
 
 
 @dataclass
@@ -57,3 +63,68 @@ class BuildTimingProfile:
             "other_seconds": other,
             "other_percent": percentage(other),
         }
+
+
+@dataclass
+class SplitterTimingProfile:
+    """Collect high-level and operation-level timings for one soft split."""
+
+    least_squares_seconds: float = 0.0
+    backtracking_seconds: float = 0.0
+    gradient_seconds: float = 0.0
+    sigmoid_seconds: float = 0.0
+    least_squares_count: int = 0
+    backtracking_count: int = 0
+    gradient_count: int = 0
+    sigmoid_count: int = 0
+    line_search_candidate_count: int = 0
+
+    @contextmanager
+    def measure(
+        self,
+        category: SplitterTimingCategory,
+        *,
+        count: bool = False,
+    ) -> Iterator[None]:
+        """Add one operation's elapsed time and optionally increment its count."""
+
+        start = perf_counter()
+        try:
+            yield
+        finally:
+            elapsed = perf_counter() - start
+            seconds_field = f"{category}_seconds"
+            setattr(self, seconds_field, getattr(self, seconds_field) + elapsed)
+            if count:
+                count_field = f"{category}_count"
+                setattr(self, count_field, getattr(self, count_field) + 1)
+
+    def count_line_search_candidate(self) -> None:
+        """Record one candidate step evaluated inside backtracking."""
+
+        self.line_search_candidate_count += 1
+
+    def summary(self, total_seconds: float) -> dict[str, float | int]:
+        """Return measured timings as fractions of total splitter wall time."""
+
+        total = max(float(total_seconds), 0.0)
+        phases = {
+            "least_squares_seconds": self.least_squares_seconds,
+            "backtracking_seconds": self.backtracking_seconds,
+            "gradient_seconds": self.gradient_seconds,
+            "sigmoid_seconds": self.sigmoid_seconds,
+        }
+        summary: dict[str, float | int] = {
+            "total_seconds": total,
+            **phases,
+            "least_squares_count": self.least_squares_count,
+            "backtracking_count": self.backtracking_count,
+            "gradient_count": self.gradient_count,
+            "sigmoid_count": self.sigmoid_count,
+            "line_search_candidate_count": self.line_search_candidate_count,
+        }
+        for name, seconds in phases.items():
+            summary[name.replace("_seconds", "_percent")] = (
+                0.0 if total == 0.0 else 100.0 * seconds / total
+            )
+        return summary

@@ -7,11 +7,18 @@ __pycache__/
 Paper/
 References/
 chumma/
+tacc_scripts/
 examples/*_outputs/
+Ros5D_full_convergence/
+results/
+paper2D/
+gale-results/
 # !examples/tree_2D_benchmark_outputs/
 # !examples/tree_2D_benchmark_outputs/**
 # examples/tree_2D_benchmark_outputs/**/*.csv
 # examples/tree_2D_benchmark_outputs/**/.DS_Store
 examples/_smoke_*/
-tests/*_outputs/
+tests/*_outputs*/
 tests/_smoke_*/
+/tests/splitter_performance/
+/pyclaw.log
